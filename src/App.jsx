@@ -777,16 +777,28 @@ export default function App() {
             />
           </label>
         </div>
-        <div className="window-toggles">
-          {metricsWindowOptions.map((opt) => (
-            <button
-              key={opt}
-              className={opt === viewWindow ? "active" : ""}
-              onClick={() => setViewWindow(opt)}
-            >
-              {opt}
-            </button>
-          ))}
+        <div className="window-controls">
+          <div className="window-toggles">
+            {metricsWindowOptions.map((opt) => (
+              <button
+                key={opt}
+                className={opt === viewWindow ? "active" : ""}
+                onClick={() => setViewWindow(opt)}
+              >
+                {opt}
+              </button>
+            ))}
+          </div>
+          <div className="slider-box compact">
+            <label>Custom Window: {windowSize}</label>
+            <input
+              type="range"
+              min="10"
+              max={history.length || 10}
+              value={Math.min(windowSize, history.length || 10)}
+              onChange={(e) => setWindowSize(parseInt(e.target.value, 10))}
+            />
+          </div>
         </div>
         <fieldset
           style={{
@@ -850,16 +862,6 @@ export default function App() {
             accuracy computed relative to that point.
           </div>
         </fieldset>
-        <div className="slider-box">
-          <label>Custom Window: {windowSize}</label>
-          <input
-            type="range"
-            min="10"
-            max={history.length || 10}
-            value={Math.min(windowSize, history.length || 10)}
-            onChange={(e) => setWindowSize(parseInt(e.target.value, 10))}
-          />
-        </div>
       </section>
       <div className="layout-grid">
         <PredictionCard

@@ -197,6 +197,28 @@ button:disabled {
   align-items: center;
   border: 1px solid #2a2d37; /* Updated border color for better visibility */
 }
+.window-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: stretch;
+  padding: 0.5rem 0.75rem;
+  background: #141b23;
+  border: 1px solid #25313c;
+  border-radius: 10px;
+}
+.window-controls .window-toggles {
+  border: none;
+  background: transparent;
+  padding-right: 0.5rem;
+  flex-wrap: wrap;
+}
+.window-controls .slider-box.compact {
+  border-left: 1px solid #25313c;
+  padding-left: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
 .slider-box {
   display: flex;
   flex-direction: column;
