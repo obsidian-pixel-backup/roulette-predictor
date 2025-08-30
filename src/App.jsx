@@ -295,6 +295,14 @@ export default function App() {
 
   const metricsWindowOptions = ["10", "25", "50", "100", "250", "500", "all"];
 
+  // Sync slider and button selection
+  useEffect(() => {
+    if (viewWindow !== "all") {
+      const w = parseInt(viewWindow, 10);
+      setWindowSize(w);
+    }
+  }, [viewWindow]);
+
   const displayedHistory = useMemo(() => {
     if (viewWindow === "all") return history;
     const w = parseInt(viewWindow, 10);
@@ -358,12 +366,13 @@ export default function App() {
         const lastClass = history[history.length - 1];
         let penalized = blendedSafe;
         if (lastClass != null) {
-          const penalty = hyperparams.repeatPenalty ?? 0.08; // reduce up to 8 percentage points (relative mass) if close
-          const minGap = hyperparams.repeatMinGap ?? 0.07; // only penalize if advantage over 2nd best < 7%
+          // Use hyperparams from UI directly, not fallback defaults
+          const penalty = Number(hyperparams.repeatPenalty);
+          const minGap = Number(hyperparams.repeatMinGap);
           const sorted = [...blendedSafe].sort((a, b) => b - a);
           const top = sorted[0];
           const second = sorted[1] ?? 0;
-          if (blendedSafe[lastClass] === top && top - second < minGap) {
+          if (penalty > 0 && blendedSafe[lastClass] === top && top - second < minGap) {
             const reduction = Math.min(
               penalty,
               blendedSafe[lastClass] - second * 0.5
@@ -375,8 +384,8 @@ export default function App() {
             penalized = sanitizeProbs(penalized);
           }
         }
-        // Stuck-run mitigation: if we've been predicting the same class for a long run with poor run accuracy and low entropy, decay its prob to encourage exploration.
-        if (predictionRecords.length > 25) {
+        // Stuck-run mitigation: more aggressive and add randomization
+        if (predictionRecords.length > 15) {
           const lastPred =
             predictionRecords[predictionRecords.length - 1]?.predicted;
           if (lastPred != null) {
@@ -385,7 +394,7 @@ export default function App() {
               if (predictionRecords[i]?.predicted === lastPred) runLen++;
               else break;
             }
-            const stuckRunThreshold = hyperparams.stuckRunThreshold ?? 20;
+            const stuckRunThreshold = hyperparams.stuckRunThreshold ?? 12; // lower threshold
             if (runLen >= stuckRunThreshold) {
               let correctInRun = 0;
               for (
@@ -401,18 +410,24 @@ export default function App() {
                 (s, p) => (p > 0 ? s + -p * Math.log2(p) : s),
                 0
               );
-              const minAcc = hyperparams.stuckMinAcc ?? 0.42; // if performance below this, treat as unhealthy lock
-              const entropyThresh = hyperparams.stuckEntropyThresh ?? 1.15; // low entropy means overconfidence collapse (max=2 for 4 classes)
+              const minAcc = hyperparams.stuckMinAcc ?? 0.55; // require higher accuracy to avoid penalty
+              const entropyThresh = hyperparams.stuckEntropyThresh ?? 1.35; // require higher entropy
               if (runAcc < minAcc && entropy < entropyThresh) {
+                // Stronger decay
                 const decay = Math.min(
-                  hyperparams.stuckPenalty ?? 0.06,
-                  blendedSafe[lastPred] * 0.5
+                  hyperparams.stuckPenalty ?? 0.12,
+                  blendedSafe[lastPred] * 0.7
                 );
                 const redistribute = decay / 3;
-                penalized = blendedSafe.map((p, i) =>
+                let noisyPenalized = blendedSafe.map((p, i) =>
                   i === lastPred ? p - decay : p + redistribute
                 );
-                penalized = sanitizeProbs(penalized);
+                // Add small randomization to all classes
+                const noiseLevel = 0.03;
+                noisyPenalized = noisyPenalized.map(
+                  (p) => p + (Math.random() - 0.5) * noiseLevel
+                );
+                penalized = sanitizeProbs(noisyPenalized);
               }
             }
           }
@@ -847,7 +862,10 @@ export default function App() {
               <button
                 key={opt}
                 className={opt === viewWindow ? "active" : ""}
-                onClick={() => setViewWindow(opt)}
+                onClick={() => {
+                  setViewWindow(opt);
+                  if (opt !== "all") setWindowSize(parseInt(opt, 10));
+                }}
               >
                 {opt}
               </button>
@@ -860,7 +878,11 @@ export default function App() {
               min="10"
               max={history.length || 10}
               value={Math.min(windowSize, history.length || 10)}
-              onChange={(e) => setWindowSize(parseInt(e.target.value, 10))}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10);
+                setWindowSize(val);
+                setViewWindow(val.toString());
+              }}
             />
           </div>
         </div>
