@@ -102,6 +102,8 @@ export default function App() {
     dynamicClamp: 0.92,
     shrinkage: 0,
   });
+  // Track when repeat penalty parameters were last changed to compute pre/post accuracy
+  const [penaltyBaselineIndex, setPenaltyBaselineIndex] = useState(null);
   const [diagnosticsSummary, setDiagnosticsSummary] = useState({});
   const [mlModel, setMlModel] = useState(null);
   const [mlProbs, setMlProbs] = useState(null);
@@ -387,9 +389,33 @@ export default function App() {
         const calSafe = sanitizeProbs(cal.probs);
         setCalibrationState(cal.calibrationState);
         setEnsembleProbs(calSafe);
+        // Compute pre/post penalty change accuracy if baseline defined
+        let penaltyComparison = null;
+        if (penaltyBaselineIndex != null && predictionRecords.length > 5) {
+          let preCorrect = 0,
+            preCount = 0,
+            postCorrect = 0,
+            postCount = 0;
+          for (let i = 0; i < predictionRecords.length && i < history.length; i++) {
+            const rec = predictionRecords[i];
+            if (!rec) continue;
+            const truth = history[i];
+            if (i < penaltyBaselineIndex) {
+              preCount++;
+              if (rec.predicted === truth) preCorrect++;
+            } else {
+              postCount++;
+              if (rec.predicted === truth) postCorrect++;
+            }
+          }
+            const preAcc = preCount ? preCorrect / preCount : null;
+            const postAcc = postCount ? postCorrect / postCount : null;
+          penaltyComparison = { preAcc, postAcc, preN: preCount, postN: postCount, baselineIdx: penaltyBaselineIndex };
+        }
         setDiagnosticsSummary((prev) => ({
           ...prev,
           lastEval: { avgAcc, avgBrier, n: history.length },
+          penaltyComparison,
         }));
         if (history.length && history.length % 100 === 0) {
           pushAlert(
@@ -749,6 +775,68 @@ export default function App() {
             </button>
           ))}
         </div>
+        <fieldset
+          style={{
+            border: "1px solid #2d3f55",
+            padding: "0.75rem 1rem",
+            borderRadius: 8,
+            marginTop: "0.75rem",
+            background: "#1a2430",
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "1.5rem",
+          }}
+        >
+          <legend style={{ padding: "0 6px", fontSize: "0.75rem" }}>
+            Repeat Penalty Tuning
+          </legend>
+          <div style={{ minWidth: 180 }}>
+            <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
+              Penalty (reduce top prob if repeats)
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={0.2}
+              step={0.005}
+              value={hyperparams.repeatPenalty ?? 0.08}
+              onChange={(e) => {
+                const val = parseFloat(e.target.value);
+                setHyperparams((h) => ({ ...h, repeatPenalty: val }));
+                setPenaltyBaselineIndex((idx) => idx ?? history.length);
+              }}
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "0.65rem" }}>
+              {(hyperparams.repeatPenalty ?? 0.08).toFixed(3)}
+            </div>
+          </div>
+          <div style={{ minWidth: 180 }}>
+            <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
+              Min Gap to Trigger (confidence gap)
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={0.2}
+              step={0.005}
+              value={hyperparams.repeatMinGap ?? 0.07}
+              onChange={(e) => {
+                const val = parseFloat(e.target.value);
+                setHyperparams((h) => ({ ...h, repeatMinGap: val }));
+                setPenaltyBaselineIndex((idx) => idx ?? history.length);
+              }}
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "0.65rem" }}>
+              {(hyperparams.repeatMinGap ?? 0.07).toFixed(3)}
+            </div>
+          </div>
+          <div style={{ fontSize: "0.6rem", maxWidth: 340, lineHeight: 1.3 }}>
+            Baseline set at spin index {penaltyBaselineIndex ?? "—"}. Pre / post
+            accuracy computed relative to that point.
+          </div>
+        </fieldset>
         <div className="slider-box">
           <label>Custom Window: {windowSize}</label>
           <input
