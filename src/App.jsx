@@ -346,12 +346,15 @@ export default function App() {
         let penalized = blendedSafe;
         if (lastClass != null) {
           const penalty = hyperparams.repeatPenalty ?? 0.08; // reduce up to 8 percentage points (relative mass) if close
-            const minGap = hyperparams.repeatMinGap ?? 0.07; // only penalize if advantage over 2nd best < 7%
+          const minGap = hyperparams.repeatMinGap ?? 0.07; // only penalize if advantage over 2nd best < 7%
           const sorted = [...blendedSafe].sort((a, b) => b - a);
           const top = sorted[0];
           const second = sorted[1] ?? 0;
           if (blendedSafe[lastClass] === top && top - second < minGap) {
-            const reduction = Math.min(penalty, blendedSafe[lastClass] - second * 0.5); // don't over-penalize
+            const reduction = Math.min(
+              penalty,
+              blendedSafe[lastClass] - second * 0.5
+            ); // don't over-penalize
             const redistribute = reduction / 3;
             penalized = blendedSafe.map((p, i) =>
               i === lastClass ? p - reduction : p + redistribute
@@ -382,7 +385,7 @@ export default function App() {
         }
         const avgAcc = cnt ? correct / cnt : 0;
         const avgBrier = cnt ? brierSum / (cnt * 4) : 0.25;
-  const cal = calibrateProbs(penalized, calibrationState, {
+        const cal = calibrateProbs(penalized, calibrationState, {
           avgAcc,
           avgBrier,
         });
@@ -396,7 +399,11 @@ export default function App() {
             preCount = 0,
             postCorrect = 0,
             postCount = 0;
-          for (let i = 0; i < predictionRecords.length && i < history.length; i++) {
+          for (
+            let i = 0;
+            i < predictionRecords.length && i < history.length;
+            i++
+          ) {
             const rec = predictionRecords[i];
             if (!rec) continue;
             const truth = history[i];
@@ -408,9 +415,15 @@ export default function App() {
               if (rec.predicted === truth) postCorrect++;
             }
           }
-            const preAcc = preCount ? preCorrect / preCount : null;
-            const postAcc = postCount ? postCorrect / postCount : null;
-          penaltyComparison = { preAcc, postAcc, preN: preCount, postN: postCount, baselineIdx: penaltyBaselineIndex };
+          const preAcc = preCount ? preCorrect / preCount : null;
+          const postAcc = postCount ? postCorrect / postCount : null;
+          penaltyComparison = {
+            preAcc,
+            postAcc,
+            preN: preCount,
+            postN: postCount,
+            baselineIdx: penaltyBaselineIndex,
+          };
         }
         setDiagnosticsSummary((prev) => ({
           ...prev,
