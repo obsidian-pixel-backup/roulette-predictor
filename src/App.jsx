@@ -140,6 +140,9 @@ export default function App() {
     [currentProbs]
   );
 
+  // Training queue and batching logic
+  const trainingQueueRef = useRef([]);
+  const TRAIN_BATCH_SIZE = 5;
   const pushSpin = useCallback(
     (cls) => {
       setHistory((prev) => {
@@ -150,6 +153,8 @@ export default function App() {
           const rec = { probs: probsSafe, predicted };
           return [...pr, rec];
         });
+        // Queue for training
+        trainingQueueRef.current.push(cls);
         // (Removed export milestone prompt per user request)
         if (newHist.length === 1)
           pushAlert("First spin recorded", "info", 4000);
@@ -190,10 +195,18 @@ export default function App() {
       setPendingQueue(0);
       return;
     }
-    const burst = simQueueRef.current.splice(0, 25); // 25 per tick
+    const burst = simQueueRef.current.splice(0, 12); // smaller burst for faster adaptive feedback
     burst.forEach((c) => pushSpin(c));
     setPendingQueue(simQueueRef.current.length);
-    setTimeout(processSimQueue, 40); // pacing delay
+    // Try flushing recompute immediately for fresher predictions between bursts
+    if (recomputeRef.current?.flush) {
+      try {
+        recomputeRef.current.flush();
+      } catch (_) {
+        /* noop */
+      }
+    }
+    setTimeout(processSimQueue, 35); // pacing delay slightly reduced
   }, [pushSpin]);
   const runSimulation = (count = 10) => {
     enqueueSimulation(count);
@@ -340,7 +353,7 @@ export default function App() {
           temperature: hyperparams.temperature || 1.0,
           clampMax: hyperparams.clampMax || 0.92,
         });
-        const blendedSafe = sanitizeProbs(blendedRaw);
+        let blendedSafe = sanitizeProbs(blendedRaw);
         // Optional repeat penalty to avoid always parroting the last class when alternatives are close.
         const lastClass = history[history.length - 1];
         let penalized = blendedSafe;
@@ -360,6 +373,48 @@ export default function App() {
               i === lastClass ? p - reduction : p + redistribute
             );
             penalized = sanitizeProbs(penalized);
+          }
+        }
+        // Stuck-run mitigation: if we've been predicting the same class for a long run with poor run accuracy and low entropy, decay its prob to encourage exploration.
+        if (predictionRecords.length > 25) {
+          const lastPred =
+            predictionRecords[predictionRecords.length - 1]?.predicted;
+          if (lastPred != null) {
+            let runLen = 0;
+            for (let i = predictionRecords.length - 1; i >= 0; i--) {
+              if (predictionRecords[i]?.predicted === lastPred) runLen++;
+              else break;
+            }
+            const stuckRunThreshold = hyperparams.stuckRunThreshold ?? 20;
+            if (runLen >= stuckRunThreshold) {
+              let correctInRun = 0;
+              for (
+                let i = predictionRecords.length - runLen;
+                i < predictionRecords.length;
+                i++
+              ) {
+                if (predictionRecords[i]?.predicted === history[i])
+                  correctInRun++;
+              }
+              const runAcc = correctInRun / runLen;
+              const entropy = blendedSafe.reduce(
+                (s, p) => (p > 0 ? s + -p * Math.log2(p) : s),
+                0
+              );
+              const minAcc = hyperparams.stuckMinAcc ?? 0.42; // if performance below this, treat as unhealthy lock
+              const entropyThresh = hyperparams.stuckEntropyThresh ?? 1.15; // low entropy means overconfidence collapse (max=2 for 4 classes)
+              if (runAcc < minAcc && entropy < entropyThresh) {
+                const decay = Math.min(
+                  hyperparams.stuckPenalty ?? 0.06,
+                  blendedSafe[lastPred] * 0.5
+                );
+                const redistribute = decay / 3;
+                penalized = blendedSafe.map((p, i) =>
+                  i === lastPred ? p - decay : p + redistribute
+                );
+                penalized = sanitizeProbs(penalized);
+              }
+            }
           }
         }
         // Evaluate recent performance
@@ -444,12 +499,13 @@ export default function App() {
         pushAlert("Prediction pipeline error", "error", 10000);
       }
     };
-    const debounced = debounce(fn, 120);
+    const debounced = debounce(fn, 60, { maxWait: 90 });
     recomputeRef.current = debounced;
     return () => debounced.cancel();
   }, [
     history,
     mlProbs,
+    predictionRecords,
     hyperparams,
     dqn,
     calibrationState,
@@ -500,69 +556,77 @@ export default function App() {
   }, [mlModel]);
 
   // Incremental training trigger (debounced by history length changes)
+  // Incremental training every TRAIN_BATCH_SIZE spins
   useEffect(() => {
     if (!mlModel) return;
-    if (history.length < seqLen + 10) return; // need minimal samples
+    if (history.length < seqLen + 10) return;
     let canceled = false;
     let retried = false;
-    (async () => {
-      try {
-        if (trainingRef.current) return; // prevent overlapping fit calls
-        trainingRef.current = true;
-        setIsTraining(true);
-        await trainIncremental(mlModel, history, {
-          seqLen,
-          epochs: 2,
-          batchSize: 32,
-        });
-        if (canceled) return;
-        const { probs, uncertainty } = await predictWithMC(mlModel, history, {
-          seqLen,
-          mcSamples: 5,
-        });
-        setMlProbs(probs);
-        setMlUncertainty(uncertainty);
-      } catch (e) {
-        console.error("ML train/predict error", e);
-        const msg = String(e?.message || e || "");
-        if (!retried) {
-          if (msg.includes("CAUSAL") || msg.includes("NotImplemented")) {
-            retried = true;
-            try {
-              const rebuilt = buildModel({ seqLen, dropout: 0.25 });
-              setMlModel(rebuilt);
-              if (!trainingRef.current) {
-                trainingRef.current = true;
-                setIsTraining(true);
-                await trainIncremental(rebuilt, history, {
-                  seqLen,
-                  epochs: 1,
-                  batchSize: 32,
-                });
+    // Only train if enough new spins have been queued and not already training
+    if (
+      trainingQueueRef.current.length >= TRAIN_BATCH_SIZE &&
+      !trainingRef.current
+    ) {
+      (async () => {
+        try {
+          trainingRef.current = true;
+          setIsTraining(true);
+          await trainIncremental(mlModel, history, {
+            seqLen,
+            epochs: 2,
+            batchSize: 32,
+          });
+          trainingQueueRef.current = [];
+          if (canceled) return;
+          const { probs, uncertainty } = await predictWithMC(mlModel, history, {
+            seqLen,
+            mcSamples: 5,
+          });
+          setMlProbs(probs);
+          setMlUncertainty(uncertainty);
+        } catch (e) {
+          console.error("ML train/predict error", e);
+          const msg = String(e?.message || e || "");
+          if (!retried) {
+            if (msg.includes("CAUSAL") || msg.includes("NotImplemented")) {
+              retried = true;
+              try {
+                const rebuilt = buildModel({ seqLen, dropout: 0.25 });
+                setMlModel(rebuilt);
+                if (!trainingRef.current) {
+                  trainingRef.current = true;
+                  setIsTraining(true);
+                  await trainIncremental(rebuilt, history, {
+                    seqLen,
+                    epochs: 1,
+                    batchSize: 32,
+                  });
+                }
+                trainingQueueRef.current = [];
+                if (!canceled) {
+                  const { probs, uncertainty } = await predictWithMC(
+                    rebuilt,
+                    history,
+                    { seqLen, mcSamples: 5 }
+                  );
+                  setMlProbs(probs);
+                  setMlUncertainty(uncertainty);
+                  pushAlert("Recovered model after rebuild", "info", 6000);
+                }
+                return;
+              } catch (re) {
+                console.error("Model rebuild failed", re);
+                pushAlert("Model rebuild failed", "error", 10000);
               }
-              if (!canceled) {
-                const { probs, uncertainty } = await predictWithMC(
-                  rebuilt,
-                  history,
-                  { seqLen, mcSamples: 5 }
-                );
-                setMlProbs(probs);
-                setMlUncertainty(uncertainty);
-                pushAlert("Recovered model after rebuild", "info", 6000);
-              }
-              return;
-            } catch (re) {
-              console.error("Model rebuild failed", re);
-              pushAlert("Model rebuild failed", "error", 10000);
             }
           }
+          pushAlert("ML train/predict error", "error", 9000);
+        } finally {
+          trainingRef.current = false;
+          setIsTraining(false);
         }
-        pushAlert("ML train/predict error", "error", 9000);
-      } finally {
-        trainingRef.current = false;
-        setIsTraining(false);
-      }
-    })();
+      })();
+    }
     return () => {
       canceled = true;
     };
