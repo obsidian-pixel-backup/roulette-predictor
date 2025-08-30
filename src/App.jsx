@@ -145,17 +145,17 @@ export default function App() {
   const TRAIN_BATCH_SIZE = 5;
   const pushSpin = useCallback(
     (cls) => {
+      // Capture prediction BEFORE adding the new spin
+      setPredictionRecords((pr) => {
+        const probsSafe = sanitizeProbs(currentProbs);
+        const predicted = probsSafe.indexOf(Math.max(...probsSafe));
+        const rec = { probs: probsSafe, predicted };
+        return [...pr, rec];
+      });
       setHistory((prev) => {
         const newHist = [...prev, cls];
-        setPredictionRecords((pr) => {
-          const probsSafe = sanitizeProbs(currentProbs);
-          const predicted = probsSafe.indexOf(Math.max(...probsSafe));
-          const rec = { probs: probsSafe, predicted };
-          return [...pr, rec];
-        });
         // Queue for training
         trainingQueueRef.current.push(cls);
-        // (Removed export milestone prompt per user request)
         if (newHist.length === 1)
           pushAlert("First spin recorded", "info", 4000);
         return newHist;
@@ -372,7 +372,11 @@ export default function App() {
           const sorted = [...blendedSafe].sort((a, b) => b - a);
           const top = sorted[0];
           const second = sorted[1] ?? 0;
-          if (penalty > 0 && blendedSafe[lastClass] === top && top - second < minGap) {
+          if (
+            penalty > 0 &&
+            blendedSafe[lastClass] === top &&
+            top - second < minGap
+          ) {
             const reduction = Math.min(
               penalty,
               blendedSafe[lastClass] - second * 0.5
