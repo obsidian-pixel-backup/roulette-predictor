@@ -41,8 +41,9 @@ export function streakProbs(history) {
     if (history[i] === last) len++;
     else break;
   }
-  // Continuation probability: base 0.5 increasing 0.05 per additional element, capped 0.85
-  const pContinue = Math.min(0.85, 0.5 + (len - 1) * 0.05);
+  // Continuation probability: was overly biased (started at 0.5). Lower base to 0.35 to reduce "echo" effect.
+  // Increase modestly with streak length, capped lower (0.75) so other signals can compete.
+  const pContinue = Math.min(0.75, 0.35 + (len - 1) * 0.05);
   const pOthers = (1 - pContinue) / 3;
   const probs = [0, 0, 0, 0].map((_, k) => (k === last ? pContinue : pOthers));
   return { probs, streak: { len, class: last, pContinue } };

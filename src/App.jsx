@@ -339,6 +339,24 @@ export default function App() {
           clampMax: hyperparams.clampMax || 0.92,
         });
         const blendedSafe = sanitizeProbs(blendedRaw);
+        // Optional repeat penalty to avoid always parroting the last class when alternatives are close.
+        const lastClass = history[history.length - 1];
+        let penalized = blendedSafe;
+        if (lastClass != null) {
+          const penalty = hyperparams.repeatPenalty ?? 0.08; // reduce up to 8 percentage points (relative mass) if close
+            const minGap = hyperparams.repeatMinGap ?? 0.07; // only penalize if advantage over 2nd best < 7%
+          const sorted = [...blendedSafe].sort((a, b) => b - a);
+          const top = sorted[0];
+          const second = sorted[1] ?? 0;
+          if (blendedSafe[lastClass] === top && top - second < minGap) {
+            const reduction = Math.min(penalty, blendedSafe[lastClass] - second * 0.5); // don't over-penalize
+            const redistribute = reduction / 3;
+            penalized = blendedSafe.map((p, i) =>
+              i === lastClass ? p - reduction : p + redistribute
+            );
+            penalized = sanitizeProbs(penalized);
+          }
+        }
         // Evaluate recent performance
         const evalWindow = 50;
         let correct = 0,
@@ -362,7 +380,7 @@ export default function App() {
         }
         const avgAcc = cnt ? correct / cnt : 0;
         const avgBrier = cnt ? brierSum / (cnt * 4) : 0.25;
-        const cal = calibrateProbs(blendedSafe, calibrationState, {
+  const cal = calibrateProbs(penalized, calibrationState, {
           avgAcc,
           avgBrier,
         });
