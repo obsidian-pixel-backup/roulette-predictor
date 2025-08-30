@@ -92,6 +92,7 @@ export default function App() {
     processed: 0,
   });
   const [ensembleProbs, setEnsembleProbs] = useState([0.25, 0.25, 0.25, 0.25]);
+  const ensembleRef = useRef([0.25, 0.25, 0.25, 0.25]);
   const [dqn, setDqn] = useState(() => new DQNWeights({ nSources: 6 })); // sources: bayes, markov, streak, ewma, ml, hmmMarkovMC
   const [hmmState, setHmmState] = useState({ probs: [0.25, 0.25, 0.25, 0.25] });
   const [mcMarkovState, setMcMarkovState] = useState({
@@ -145,11 +146,18 @@ export default function App() {
   const TRAIN_BATCH_SIZE = 5;
   const pushSpin = useCallback(
     (cls) => {
-      // Capture prediction BEFORE adding the new spin
+      // Capture prediction BEFORE adding the new spin using latest ensembleRef
       setPredictionRecords((pr) => {
-        const probsSafe = sanitizeProbs(currentProbs);
+        const probsSafe = sanitizeProbs(
+          ensembleRef.current || [0.25, 0.25, 0.25, 0.25]
+        );
         const predicted = probsSafe.indexOf(Math.max(...probsSafe));
         const rec = { probs: probsSafe, predicted };
+        console.debug("pushSpin: recording prediction", {
+          probsSafe,
+          predicted,
+          cls,
+        });
         return [...pr, rec];
       });
       setHistory((prev) => {
@@ -161,7 +169,7 @@ export default function App() {
         return newHist;
       });
     },
-    [currentProbs, currentPrediction]
+    [pushAlert]
   );
 
   const handleManualClassAdd = (cls) => {
@@ -185,6 +193,7 @@ export default function App() {
     }
     setPendingQueue(simQueueRef.current.length);
   };
+  // Simulation queue: process spins one at a time, waiting for prediction update
   const processSimQueue = useCallback(() => {
     if (simStopRef.current) {
       setIsSimulating(false);
@@ -195,24 +204,52 @@ export default function App() {
       setPendingQueue(0);
       return;
     }
-    const burst = simQueueRef.current.splice(0, 12); // smaller burst for faster adaptive feedback
-    burst.forEach((c) => pushSpin(c));
+    const nextSpin = simQueueRef.current.shift();
+    pushSpin(nextSpin);
     setPendingQueue(simQueueRef.current.length);
-    // Try flushing recompute immediately for fresher predictions between bursts
-    if (recomputeRef.current?.flush) {
-      try {
-        recomputeRef.current.flush();
-      } catch (_) {
-        /* noop */
+    // Force prediction pipeline to run immediately after spin is pushed
+    if (recomputeRef.current) {
+      if (typeof recomputeRef.current.flush === "function") {
+        try {
+          recomputeRef.current.flush();
+        } catch (_) {}
+      } else if (typeof recomputeRef.current === "function") {
+        try {
+          recomputeRef.current();
+        } catch (_) {}
       }
     }
-    setTimeout(processSimQueue, 35); // pacing delay slightly reduced
+    // Schedule next spin after a short delay so recompute can run and update ensembleRef
+    setTimeout(() => {
+      if (simStopRef.current) {
+        setIsSimulating(false);
+        return;
+      }
+      // proceed to next spin
+      processSimQueue();
+    }, 50);
   }, [pushSpin]);
+
+  // The simulation progression is paced inside processSimQueue to avoid racing
+  // with React state updates and the recompute pipeline. Removed the previous
+  // effect-based progression which could process the next spin before
+  // recompute had a chance to update ensemble probabilities.
+
   const runSimulation = (count = 10) => {
     enqueueSimulation(count);
     if (!isSimulating) {
       simStopRef.current = false;
+      // Ensure ensembleRef is fresh before recording predictions
+      if (recomputeRef.current) {
+        try {
+          if (typeof recomputeRef.current.flush === "function")
+            recomputeRef.current.flush();
+          else if (typeof recomputeRef.current === "function")
+            recomputeRef.current();
+        } catch (_) {}
+      }
       setIsSimulating(true);
+      // Start first spin
       processSimQueue();
     }
   };
@@ -220,7 +257,17 @@ export default function App() {
     enqueueSimulation(total);
     if (!isSimulating) {
       simStopRef.current = false;
+      // Ensure ensembleRef is fresh before recording predictions
+      if (recomputeRef.current) {
+        try {
+          if (typeof recomputeRef.current.flush === "function")
+            recomputeRef.current.flush();
+          else if (typeof recomputeRef.current === "function")
+            recomputeRef.current();
+        } catch (_) {}
+      }
       setIsSimulating(true);
+      // Start first spin
       processSimQueue();
     }
   };
@@ -464,8 +511,27 @@ export default function App() {
           avgBrier,
         });
         const calSafe = sanitizeProbs(cal.probs);
+        // Debug: if ensemble ends up uniform, log source details to help trace
+        const isUniform = calSafe.every((p) => Math.abs(p - 0.25) < 1e-6);
+        if (isUniform && history.length) {
+          try {
+            console.debug(
+              "recompute: ensemble uniform => dumping sources/weights",
+              {
+                historyLen: history.length,
+                sources: safeSources,
+                weights,
+                blendedRaw,
+                penalized,
+                calSafe,
+              }
+            );
+          } catch (_) {}
+        }
         setCalibrationState(cal.calibrationState);
         setEnsembleProbs(calSafe);
+        // keep ref in sync for synchronous access during pushSpin (esp. simulation)
+        ensembleRef.current = calSafe;
         // Compute pre/post penalty change accuracy if baseline defined
         let penaltyComparison = null;
         if (penaltyBaselineIndex != null && predictionRecords.length > 5) {
@@ -547,14 +613,9 @@ export default function App() {
     dqn.updateReward(reward);
     const action = dqn.chooseAction(rec.probs);
     dqn.applyAction(action);
-    setDqn(
-      new DQNWeights({
-        nSources: dqn.nSources,
-        learningRate: dqn.learningRate,
-        epsilon: dqn.epsilon,
-      })
-    );
-    // copy weights
+    // DQN instance is updated in-place by its methods above. Avoid recreating
+    // the DQN object here because that would change `dqn` state every render
+    // and trigger other effects that depend on `dqn`, causing render loops.
   }, [history, predictionRecords]);
 
   // Auto-tuner every 50 spins
