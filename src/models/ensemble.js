@@ -176,6 +176,33 @@ export class DQNWeights {
     const s = this.weights.reduce((a, b) => a + b, 0) || 1;
     this.weights = this.weights.map((w) => w / s);
   }
+
+  // Return a JSON-serializable representation of the DQNWeights state
+  toJSON() {
+    return {
+      nSources: this.nSources,
+      learningRate: this.learningRate,
+      epsilon: this.epsilon,
+      weights: Array.isArray(this.weights) ? this.weights.slice() : [],
+      lastReward: this._lastReward,
+      lastAction: this._lastAction,
+    };
+  }
+
+  // Reconstruct a DQNWeights instance from a serialized object
+  static fromJSON(obj = {}) {
+    const inst = new DQNWeights({
+      nSources: obj.nSources || (Array.isArray(obj.weights) ? obj.weights.length : 0),
+      learningRate: typeof obj.learningRate === 'number' ? obj.learningRate : 0.01,
+      epsilon: typeof obj.epsilon === 'number' ? obj.epsilon : 0.2,
+    });
+    if (Array.isArray(obj.weights) && obj.weights.length === inst.nSources) {
+      inst.weights = obj.weights.slice();
+    }
+    inst._lastReward = typeof obj.lastReward === 'number' ? obj.lastReward : 0;
+    inst._lastAction = obj.lastAction ?? null;
+    return inst;
+  }
 }
 
 export function blendLogSpace(

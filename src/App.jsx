@@ -963,16 +963,52 @@ export default function App() {
     } catch (e) {
       console.warn("Model export failed", e);
     }
+    // Build verbose per-spin diagnostics aligned with history
+    const perSpin = (history || []).map((truth, idx) => {
+      const rec = (predictionRecords && predictionRecords[idx]) || {};
+      const probs = rec.probs || ensembleRef.current || [0.25, 0.25, 0.25, 0.25];
+      const sourceProbs = Array.isArray(rec.sourceProbs)
+        ? rec.sourceProbs.map((s) => sanitizeProbs(s))
+        : undefined;
+      const predicted = rec.predicted == null ? (probs ? probs.indexOf(Math.max(...probs)) : null) : rec.predicted;
+      const skipped = !!rec.skipped;
+      // brier for this spin
+      const brier = probs
+        ? probs.reduce((acc, p, k) => acc + Math.pow(p - (truth === k ? 1 : 0), 2), 0) / 4
+        : null;
+      return {
+        index: idx,
+        truth,
+        probs: sanitizeProbs(probs),
+        sourceProbs,
+        predicted,
+        skipped,
+        maxProb: rec.maxProb ?? Math.max(...(probs || [0.25, 0.25, 0.25, 0.25])),
+        mlProbs: rec.mlProbs || (mlProbs ? mlProbs : undefined),
+        mlUncertainty: rec.mlUncertainty || (mlUncertainty ? mlUncertainty : undefined),
+        calibrationSnapshot: calibrationState,
+        brier,
+        ts: rec.ts || null,
+      };
+    });
+
+    const dqnStatePayload = dqn && typeof dqn.toJSON === 'function' ? dqn.toJSON() : {
+      nSources: dqn?.nSources ?? null,
+      weights: Array.isArray(dqn?.weights) ? dqn.weights.slice() : null,
+      epsilon: dqn?.epsilon ?? null,
+    };
+
     exportStateJSON({
       history,
       predictionRecords,
+      perSpin,
       hyperparams,
       bayesState,
       markovState,
       streakState,
       ewmaState,
       mlModelJSON,
-      dqnState: dqn.toJSON(),
+      dqnState: dqnStatePayload,
       hmmState,
       mcMarkovState,
       calibrationState,
@@ -1092,18 +1128,31 @@ export default function App() {
             </div>
           );
         })()}
-        <div style={{ marginLeft: 12, position: "relative" }}>
-          <div className="toast-anchor">
-            {alerts.map((a) => (
-              <div
-                key={a.id}
-                className={`alert-toast alert-${a.type}`}
-                role={a.type === "error" ? "alert" : "status"}
-                aria-live={a.type === "error" ? "assertive" : "polite"}
-              >
-                {a.msg}
+        <div style={{ marginLeft: 12, position: "relative", width: '320px' }}>
+          <div className="alerts-wrapper" role="region" aria-label="alerts">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+              <strong style={{ color: '#cfe3ff' }}>Alerts</strong>
+              <div style={{ marginLeft: 'auto' }}>
+                <button
+                  onClick={() => setAlerts([])}
+                  title="Clear alerts"
+                  style={{ background: 'transparent', border: 'none', color: '#cfe3ff', cursor: 'pointer' }}
+                >
+                  Clear
+                </button>
               </div>
-            ))}
+            </div>
+            <div style={{ marginTop: 6 }}>
+              {alerts.length === 0 ? (
+                <div className="alert-banner" style={{ background: 'transparent', border: '1px dashed #2d3b47', color: '#9fb2c8' }}>No recent alerts</div>
+              ) : (
+                alerts.map((a) => (
+                  <div key={a.id} className="alert-banner alert-${a.type}" role={a.type === 'error' ? 'alert' : 'status'} aria-live={a.type === 'error' ? 'assertive' : 'polite'}>
+                    {a.msg}
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         </div>
       </header>
