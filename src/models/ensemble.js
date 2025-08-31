@@ -192,14 +192,16 @@ export class DQNWeights {
   // Reconstruct a DQNWeights instance from a serialized object
   static fromJSON(obj = {}) {
     const inst = new DQNWeights({
-      nSources: obj.nSources || (Array.isArray(obj.weights) ? obj.weights.length : 0),
-      learningRate: typeof obj.learningRate === 'number' ? obj.learningRate : 0.01,
-      epsilon: typeof obj.epsilon === 'number' ? obj.epsilon : 0.2,
+      nSources:
+        obj.nSources || (Array.isArray(obj.weights) ? obj.weights.length : 0),
+      learningRate:
+        typeof obj.learningRate === "number" ? obj.learningRate : 0.01,
+      epsilon: typeof obj.epsilon === "number" ? obj.epsilon : 0.2,
     });
     if (Array.isArray(obj.weights) && obj.weights.length === inst.nSources) {
       inst.weights = obj.weights.slice();
     }
-    inst._lastReward = typeof obj.lastReward === 'number' ? obj.lastReward : 0;
+    inst._lastReward = typeof obj.lastReward === "number" ? obj.lastReward : 0;
     inst._lastAction = obj.lastAction ?? null;
     return inst;
   }
@@ -412,6 +414,40 @@ export function autoTuner({
     if (biasDetected && biasRes && biasRes.chi2) {
       const biasStrength = Math.min(1, biasRes.chi2 / (biasRes.chi2 + 10));
       score += biasStrength * (cand.ewmaLambda || 0) * 0.6;
+      // reward candidates that align with short-term observed frequency
+      const shortWindow = Math.min(100, history.length);
+      const observedCountsShort = [0, 0, 0, 0];
+      for (
+        let i = Math.max(0, history.length - shortWindow);
+        i < history.length;
+        i++
+      ) {
+        const c = history[i];
+        if (typeof c === "number") observedCountsShort[c]++;
+      }
+      const obsFreqShort = observedCountsShort.map(
+        (v) => v / Math.max(1, shortWindow)
+      );
+      // compute mean of recorded final probs over the eval window as a proxy
+      try {
+        const meanProbs = [0, 0, 0, 0];
+        let meanCnt = 0;
+        for (let i = start; i < Math.min(predictionRecords.length, n); i++) {
+          const rec = predictionRecords[i];
+          if (!rec || !Array.isArray(rec.probs)) continue;
+          const p = rec.probs;
+          for (let k = 0; k < 4; k++) meanProbs[k] += p[k] || 0;
+          meanCnt++;
+        }
+        if (meanCnt > 0) for (let k = 0; k < 4; k++) meanProbs[k] /= meanCnt;
+        let sim = 0;
+        for (let k = 0; k < 4; k++)
+          sim -= Math.pow((meanProbs[k] || 0) - (obsFreqShort[k] || 0), 2);
+        // small positive adjustment if ensemble aligns with observed short-term freq
+        score += Math.max(-0.2, sim) * 0.5;
+      } catch (err) {
+        // ignore
+      }
     }
     // penalize expensive candidates slightly
     score -= (cand.mcMarkovSims || 0) / 20000;
@@ -518,4 +554,44 @@ export function autoTuner({
       divergenceDetected,
     },
   };
+}
+
+// Simple CUSUM-like detector on recent class frequency vectors.
+// Returns { changed: bool, score: number, suggested: { ewmaLambdaMult, lrMult, replayBoostMult } }
+export function detectChangePoint(
+  history,
+  { window = 200, seg = 20, threshold = 0.25 } = {}
+) {
+  if (!Array.isArray(history) || history.length < Math.max(window, seg * 3)) {
+    return { changed: false, score: 0, suggested: null };
+  }
+  const recent = history.slice(-window);
+  // compute sliding frequency vectors over segments
+  const freqVecs = [];
+  for (let i = 0; i + seg <= recent.length; i += seg) {
+    const segArr = recent.slice(i, i + seg);
+    const cnt = [0, 0, 0, 0];
+    segArr.forEach((c) => cnt[c]++);
+    const tot = segArr.length || 1;
+    freqVecs.push(cnt.map((v) => v / tot));
+  }
+  if (freqVecs.length < 3) return { changed: false, score: 0, suggested: null };
+  // compare last vector to previous mean
+  const last = freqVecs[freqVecs.length - 1];
+  const prevMean = [0, 0, 0, 0];
+  for (let i = 0; i < freqVecs.length - 1; i++)
+    freqVecs[i].forEach((v, k) => (prevMean[k] += v));
+  for (let k = 0; k < 4; k++) prevMean[k] /= Math.max(1, freqVecs.length - 1);
+  // score: L1 distance
+  let dist = 0;
+  for (let k = 0; k < 4; k++) dist += Math.abs(last[k] - prevMean[k]);
+  const changed = dist >= threshold;
+  const suggested = changed
+    ? {
+        ewmaLambdaMult: Math.min(3, 1 + dist * 4),
+        lrMult: Math.min(5, 1 + dist * 6),
+        replayBoostMult: Math.min(4, 1 + dist * 4),
+      }
+    : null;
+  return { changed, score: dist, suggested };
 }

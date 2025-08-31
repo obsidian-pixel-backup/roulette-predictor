@@ -141,11 +141,13 @@ export function calibrateProbs(rawProbs, calibrationState, perf, options = {}) {
   }
 
   maxP = Math.max(...probs);
-  const predicted = maxP < dynamicThreshold ? -1 : probs.indexOf(maxP);
+  const predicted = probs.indexOf(maxP);
+  const skipped = maxP < dynamicThreshold;
 
   return {
     probs,
     predicted,
+    skipped,
     calibrationState: {
       dynamicTemperature,
       dynamicClamp,

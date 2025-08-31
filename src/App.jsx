@@ -33,6 +33,7 @@ import {
   autoTuner,
   hmmProbs,
   detectFreqBias,
+  detectChangePoint,
   shiftProbsTowardObserved,
 } from "./models/ensemble";
 import { patternProbs } from "./models/patterns";
@@ -148,26 +149,27 @@ export default function App() {
   // Training queue and batching logic
   const trainingQueueRef = useRef([]);
   const TRAIN_BATCH_SIZE = 5;
+  const changeScheduleRef = useRef(null); // transient schedule after change-point detection
   const pushSpin = useCallback(
     (cls) => {
       // Capture prediction BEFORE adding the new spin using latest ensembleRef
       setPredictionRecords((pr) => {
+        // Record a placeholder prediction record; leave `predicted` null so
+        // the recompute pipeline (which runs shortly after) can apply
+        // calibration and the final decision. This avoids transient -1
+        // no-bet markers that were based on stale hyperparams or pre-calibration.
         const probsSafe = sanitizeProbs(
           ensembleRef.current || [0.25, 0.25, 0.25, 0.25]
         );
         const maxP = Math.max(...probsSafe);
-        const predicted = probsSafe.indexOf(maxP);
-        const confThresh =
-          Number(hyperparams.predictionConfidenceThreshold) || 0.3;
         const rec = {
           probs: probsSafe,
-          predicted: maxP >= confThresh ? predicted : null,
-          skipped: maxP < confThresh,
+          predicted: null,
+          skipped: false,
           maxProb: maxP,
         };
-        console.debug("pushSpin: recording prediction", {
+        console.debug("pushSpin: queued prediction (pending calibration)", {
           probsSafe,
-          predicted,
           cls,
         });
         return [...pr, rec];
@@ -328,10 +330,13 @@ export default function App() {
       try {
         const sanitized = imported.predictionRecords.map((rec) => {
           const probs = sanitizeProbs(rec.probs);
+          const maxP = Math.max(...probs);
           const predicted =
-            typeof rec.predicted === "number"
+            typeof rec.predicted === "number" &&
+            rec.predicted >= 0 &&
+            rec.predicted <= 3
               ? rec.predicted
-              : probs.indexOf(Math.max(...probs));
+              : probs.indexOf(maxP);
           // If sourceProbs were exported, sanitize each source array too
           const sourceProbs = Array.isArray(rec.sourceProbs)
             ? rec.sourceProbs.map((s) => sanitizeProbs(s))
@@ -441,9 +446,18 @@ export default function App() {
           mc.probs,
           pat.probs,
         ];
-        if (dqn.nSources !== sources.length)
-          setDqn(new DQNWeights({ nSources: sources.length }));
-        const weights = dqn.weights.slice(0, sources.length);
+        // Use a local DQN instance so we react immediately to source-count changes
+        let localDqn = dqn;
+        if (!localDqn || localDqn.nSources !== sources.length) {
+          localDqn = new DQNWeights({ nSources: sources.length });
+          // persist immediately so other effects see correct shape
+          try {
+            setDqn(localDqn);
+          } catch (e) {
+            // non-fatal: continue with local instance
+          }
+        }
+        const weights = (localDqn.weights || []).slice(0, sources.length);
         // Sanitize each source before blending to avoid propagating NaNs
         const safeSources = sources.map((s) => sanitizeProbs(s));
 
@@ -467,9 +481,9 @@ export default function App() {
             minSamples: Number(hyperparams.biasMinSamples) || 60,
           });
           if (biasRes && biasRes.biased) {
-            // boost bayes & ewma contributions in DQN
-            if (typeof dqn.applyBiasAdjustment === "function") {
-              dqn.applyBiasAdjustment(
+            // boost bayes & ewma contributions in DQN (use localDqn)
+            if (typeof localDqn.applyBiasAdjustment === "function") {
+              localDqn.applyBiasAdjustment(
                 [
                   observedCounts[0] /
                     Math.max(
@@ -522,6 +536,64 @@ export default function App() {
         } catch (e) {
           console.debug("bias detect failed", e);
         }
+        // --- Change-point detection (CUSUM-like) to trigger transient recency boosts ---
+        try {
+          const cp = detectChangePoint(history, {
+            window: Number(hyperparams.cpWindow) || 200,
+            seg: Number(hyperparams.cpSeg) || 20,
+            threshold: Number(hyperparams.cpThreshold) || 0.28,
+          });
+          if (cp && cp.changed) {
+            // Use a cooldown to avoid firing on nearly every spin
+            const now = Date.now();
+            const cooldown = Number(hyperparams.cpCooldownMs) || 120000; // 120s default
+            const lastTrig =
+              (changeScheduleRef.current &&
+                changeScheduleRef.current.lastTriggered) ||
+              0;
+            if (now - lastTrig > cooldown) {
+              // Moderate the suggested multipliers to be less aggressive by default
+              const raw = cp.suggested || {};
+              const suggested = {
+                ewmaLambdaMult: Math.min(
+                  raw.ewmaLambdaMult || 1,
+                  Number(hyperparams.cpMaxEwmaMult) || 1.8
+                ),
+                lrMult: Math.min(
+                  raw.lrMult || 1,
+                  Number(hyperparams.cpMaxLrMult) || 2.5
+                ),
+                replayBoostMult: Math.min(
+                  raw.replayBoostMult || 1,
+                  Number(hyperparams.cpMaxReplayMult) || 2.0
+                ),
+              };
+              // schedule a short-lived boost: increase ewma lambda, lr, replayBoost and reduce decayLambda
+              changeScheduleRef.current = {
+                until: now + (Number(hyperparams.cpDurationMs) || 15000),
+                suggested,
+                lastTriggered: now,
+                score: cp.score,
+              };
+              pushAlert(
+                `Change detected (score=${cp.score.toFixed(
+                  3
+                )}). Applying transient recency boost.`,
+                "metric",
+                4000
+              );
+            } else {
+              // suppress frequent re-triggers
+              console.debug("change detect suppressed by cooldown", {
+                score: cp.score,
+                lastTriggered: lastTrig,
+                cooldown,
+              });
+            }
+          }
+        } catch (e) {
+          console.debug("change detect failed", e);
+        }
         // Compute per-source rolling performance (accuracy / (brier + eps)) and update DQN weights
         try {
           const nSources = safeSources.length;
@@ -565,8 +637,8 @@ export default function App() {
             perfScores = dqn.weights.slice(0, nSources);
           }
           // Apply to DQN with moderate smoothing (alpha)
-          if (typeof dqn.applyPerformanceWeights === "function") {
-            dqn.applyPerformanceWeights(perfScores, 0.6);
+          if (typeof localDqn.applyPerformanceWeights === "function") {
+            localDqn.applyPerformanceWeights(perfScores, 0.6);
           } else if (totalScore) {
             // fallback: normalize and assign locally
             const normalized = perfScores.map((s) => Math.max(0.01, s));
@@ -711,8 +783,13 @@ export default function App() {
           const rec = predictionRecords[i];
           if (!rec) continue;
           const truth = history[i];
-          if (rec.predicted === truth) correct++;
           const probs = rec.probs || [0.25, 0.25, 0.25, 0.25];
+          // If rec.predicted is null (queued, pre-calibration), use the max-prob index as the implied prediction
+          const impliedPred =
+            rec.predicted == null
+              ? probs.indexOf(Math.max(...probs))
+              : rec.predicted;
+          if (impliedPred === truth) correct++;
           for (let k = 0; k < 4; k++) {
             const y = truth === k ? 1 : 0;
             brierSum += (probs[k] - y) * (probs[k] - y);
@@ -745,6 +822,51 @@ export default function App() {
         }
         setCalibrationState(cal.calibrationState);
         setEnsembleProbs(calSafe);
+        // Update the latest prediction record (the one created by pushSpin) to store
+        // the calibrated probabilities and derived decision so training/analysis
+        // use the final post-calibration prediction.
+        try {
+          setPredictionRecords((prev) => {
+            if (!Array.isArray(prev) || prev.length === 0) return prev;
+            const idx = prev.length - 1;
+            const old = prev[idx] || {};
+            const newRec = {
+              ...old,
+              probs: sanitizeProbs(calSafe),
+              sourceProbs: safeSources,
+              mlProbs: mlProbs || old.mlProbs,
+              mlUncertainty: mlUncertainty || old.mlUncertainty,
+              predicted:
+                cal.predicted == null
+                  ? sanitizeProbs(calSafe).indexOf(
+                      Math.max(...sanitizeProbs(calSafe))
+                    )
+                  : cal.predicted,
+              skipped: !!cal.skipped,
+              maxProb: Math.max(...(calSafe || [0.25, 0.25, 0.25, 0.25])),
+              calibrationState: cal.calibrationState,
+              brier:
+                typeof history[idx] === "number"
+                  ? sanitizeProbs(calSafe).reduce(
+                      (acc, p, k) =>
+                        acc + Math.pow(p - (history[idx] === k ? 1 : 0), 2),
+                      0
+                    ) / 4
+                  : null,
+            };
+            const copy = prev.slice();
+            copy[idx] = newRec;
+            return copy;
+          });
+        } catch (e) {
+          // non-fatal
+        }
+        // Persist any localDqn mutations back into React state to keep in sync
+        try {
+          setDqn(localDqn);
+        } catch (e) {
+          // ignore
+        }
         // keep ref in sync for synchronous access during pushSpin (esp. simulation)
         ensembleRef.current = calSafe;
         // Compute pre/post penalty change accuracy if baseline defined
@@ -845,7 +967,8 @@ export default function App() {
   // Initialize model lazily
   useEffect(() => {
     if (!mlModel) {
-      const m = buildModel({ seqLen, dropout: 0.25 });
+      const ef = Number(hyperparams.extraFeatures) || 6;
+      const m = buildModel({ seqLen, dropout: 0.25, extraFeatures: ef });
       setMlModel(m);
     }
   }, [mlModel]);
@@ -866,7 +989,9 @@ export default function App() {
         try {
           trainingRef.current = true;
           setIsTraining(true);
-          await trainIncremental(mlModel, history, {
+          // Base params
+          const extraFeatures = Number(hyperparams.extraFeatures) || 6;
+          const baseParams = {
             seqLen,
             epochs: 2,
             batchSize: 32,
@@ -883,12 +1008,46 @@ export default function App() {
             streakWindow: Number(hyperparams.streakWindow) || 10,
             streakThreshold: Number(hyperparams.streakThreshold) || 5,
             streakBoost: Number(hyperparams.streakBoost) || 1.5,
-          });
+            // user-configurable downweight for the rare zero class
+            zeroWeight: Number(hyperparams.zeroWeight) || 0.25,
+            extraFeatures,
+            ewmaLambda: Number(hyperparams.ewmaLambda) || 0.12,
+          };
+          // Apply transient change-point boosts if scheduled
+          if (
+            changeScheduleRef.current &&
+            Date.now() < changeScheduleRef.current.until
+          ) {
+            const sug = changeScheduleRef.current.suggested || {};
+            // cap lrMult effect on epochs to avoid runaway large epoch counts
+            const lrMult = Math.min(
+              sug.lrMult || 1,
+              Number(hyperparams.cpMaxLrMult) || 2.5
+            );
+            const epochMult = Math.min(2.0, Math.max(1.0, lrMult));
+            baseParams.epochs = Math.max(
+              1,
+              Math.floor((baseParams.epochs || 2) * epochMult)
+            );
+            baseParams.decayLambda = Math.max(
+              0,
+              (baseParams.decayLambda || 0) * 0.5
+            );
+            baseParams.replayBoost =
+              (baseParams.replayBoost || 1) * (sug.replayBoostMult || 2);
+            baseParams.ewmaLambda = Math.min(
+              0.9,
+              (baseParams.ewmaLambda || 0.12) * (sug.ewmaLambdaMult || 2)
+            );
+          }
+          await trainIncremental(mlModel, history, baseParams);
           trainingQueueRef.current = [];
           if (canceled) return;
           const { probs, uncertainty } = await predictWithMC(mlModel, history, {
             seqLen,
             mcSamples: 5,
+            extraFeatures: Number(hyperparams.extraFeatures) || 6,
+            ewmaLambda: Number(hyperparams.ewmaLambda) || 0.12,
           });
           setMlProbs(probs);
           setMlUncertainty(uncertainty);
@@ -899,7 +1058,12 @@ export default function App() {
             if (msg.includes("CAUSAL") || msg.includes("NotImplemented")) {
               retried = true;
               try {
-                const rebuilt = buildModel({ seqLen, dropout: 0.25 });
+                const ef = Number(hyperparams.extraFeatures) || 6;
+                const rebuilt = buildModel({
+                  seqLen,
+                  dropout: 0.25,
+                  extraFeatures: ef,
+                });
                 setMlModel(rebuilt);
                 if (!trainingRef.current) {
                   trainingRef.current = true;
@@ -921,6 +1085,9 @@ export default function App() {
                     streakWindow: Number(hyperparams.streakWindow) || 10,
                     streakThreshold: Number(hyperparams.streakThreshold) || 5,
                     streakBoost: Number(hyperparams.streakBoost) || 1.5,
+                    zeroWeight: Number(hyperparams.zeroWeight) || 0.25,
+                    extraFeatures: ef,
+                    ewmaLambda: Number(hyperparams.ewmaLambda) || 0.12,
                   });
                 }
                 trainingQueueRef.current = [];
@@ -928,7 +1095,12 @@ export default function App() {
                   const { probs, uncertainty } = await predictWithMC(
                     rebuilt,
                     history,
-                    { seqLen, mcSamples: 5 }
+                    {
+                      seqLen,
+                      mcSamples: 5,
+                      extraFeatures: Number(hyperparams.extraFeatures) || 6,
+                      ewmaLambda: Number(hyperparams.ewmaLambda) || 0.12,
+                    }
                   );
                   setMlProbs(probs);
                   setMlUncertainty(uncertainty);
@@ -964,44 +1136,140 @@ export default function App() {
       console.warn("Model export failed", e);
     }
     // Build verbose per-spin diagnostics aligned with history
+    const accArr = [];
+    const brierArr = [];
+    const confArr = [];
+    const classCounts = [0, 0, 0, 0];
+    let skipCount = 0;
     const perSpin = (history || []).map((truth, idx) => {
       const rec = (predictionRecords && predictionRecords[idx]) || {};
-      const probs = rec.probs || ensembleRef.current || [0.25, 0.25, 0.25, 0.25];
+      const probsRaw = rec.probs ||
+        ensembleRef.current || [0.25, 0.25, 0.25, 0.25];
+      const probs = sanitizeProbs(probsRaw);
       const sourceProbs = Array.isArray(rec.sourceProbs)
         ? rec.sourceProbs.map((s) => sanitizeProbs(s))
         : undefined;
-      const predicted = rec.predicted == null ? (probs ? probs.indexOf(Math.max(...probs)) : null) : rec.predicted;
+      const maxP = Math.max(...probs);
+      const sorted = probs.map((p, i) => ({ p, i })).sort((a, b) => b.p - a.p);
+      const topIndex = sorted[0].i;
+      const top2Gap = sorted[0].p - (sorted[1]?.p ?? 0) || 0;
+      const entropy = -probs.reduce(
+        (s, p) => (p > 0 ? s + p * Math.log2(p) : s),
+        0
+      );
+      const predicted =
+        typeof rec.predicted === "number" &&
+        rec.predicted >= 0 &&
+        rec.predicted <= 3
+          ? rec.predicted
+          : topIndex;
       const skipped = !!rec.skipped;
       // brier for this spin
       const brier = probs
-        ? probs.reduce((acc, p, k) => acc + Math.pow(p - (truth === k ? 1 : 0), 2), 0) / 4
+        ? probs.reduce(
+            (acc, p, k) => acc + Math.pow(p - (truth === k ? 1 : 0), 2),
+            0
+          ) / 4
         : null;
+
+      // accumulate summary arrays
+      if (typeof truth === "number" && truth >= 0 && truth < 4)
+        classCounts[truth]++;
+      if (skipped) skipCount++;
+      accArr.push(predicted === truth ? 1 : 0);
+      brierArr.push(isFinite(brier) ? brier : 0);
+      confArr.push(maxP);
+
       return {
         index: idx,
         truth,
-        probs: sanitizeProbs(probs),
+        probs,
         sourceProbs,
         predicted,
         skipped,
-        maxProb: rec.maxProb ?? Math.max(...(probs || [0.25, 0.25, 0.25, 0.25])),
-        mlProbs: rec.mlProbs || (mlProbs ? mlProbs : undefined),
-        mlUncertainty: rec.mlUncertainty || (mlUncertainty ? mlUncertainty : undefined),
+        maxProb: maxP,
+        topIndex,
+        top2Gap,
+        entropy,
+        mlProbs: rec.mlProbs || undefined,
+        mlUncertainty:
+          rec.mlUncertainty || (mlUncertainty ? mlUncertainty : undefined),
         calibrationSnapshot: calibrationState,
         brier,
         ts: rec.ts || null,
       };
     });
 
-    const dqnStatePayload = dqn && typeof dqn.toJSON === 'function' ? dqn.toJSON() : {
-      nSources: dqn?.nSources ?? null,
-      weights: Array.isArray(dqn?.weights) ? dqn.weights.slice() : null,
-      epsilon: dqn?.epsilon ?? null,
+    // helper: simple rolling mean of last w values
+    const rollingMean = (arr, w) => {
+      if (!arr || !arr.length) return null;
+      const L = arr.length;
+      const start = Math.max(0, L - w);
+      const slice = arr.slice(start, L);
+      const s = slice.reduce((a, b) => a + b, 0) || 0;
+      return s / slice.length;
+    };
+
+    const observedFreq = countsToProbs(classCounts);
+    const totalSpins = history ? history.length : 0;
+    const skipRate = totalSpins ? skipCount / totalSpins : 0;
+    const threshold =
+      (hyperparams && hyperparams.predictionConfidenceThreshold) || 0.3;
+    const coverage = confArr.length
+      ? confArr.filter((v) => v >= threshold).length / confArr.length
+      : 0;
+    const rollingMetrics = {
+      last50: {
+        acc: rollingMean(accArr, 50),
+        brier: rollingMean(brierArr, 50),
+        conf: rollingMean(confArr, 50),
+      },
+      last100: {
+        acc: rollingMean(accArr, 100),
+        brier: rollingMean(brierArr, 100),
+        conf: rollingMean(confArr, 100),
+      },
+      last250: {
+        acc: rollingMean(accArr, 250),
+        brier: rollingMean(brierArr, 250),
+        conf: rollingMean(confArr, 250),
+      },
+    };
+
+    const dqnStatePayload =
+      dqn && typeof dqn.toJSON === "function"
+        ? dqn.toJSON()
+        : {
+            nSources: dqn?.nSources ?? null,
+            weights: Array.isArray(dqn?.weights) ? dqn.weights.slice() : null,
+            epsilon: dqn?.epsilon ?? null,
+          };
+
+    // change-point detection summary
+    const cp = detectChangePoint(history, {
+      window: 200,
+      seg: 20,
+      threshold: 0.28,
+    });
+
+    const diagnostics = {
+      totalSpins: history ? history.length : 0,
+      classCounts: classCounts.slice(),
+      observedFreq,
+      skipRate,
+      coverage,
+      rollingMetrics,
+      changePoint: cp,
+      dqnState: dqnStatePayload,
+      lastCalibration: calibrationState,
+      lastDiagnosticsSummary: diagnosticsSummary || {},
     };
 
     exportStateJSON({
       history,
       predictionRecords,
       perSpin,
+      diagnostics,
       hyperparams,
       bayesState,
       markovState,
@@ -1128,15 +1396,27 @@ export default function App() {
             </div>
           );
         })()}
-        <div style={{ marginLeft: 12, position: "relative", width: '320px' }}>
+        <div style={{ marginLeft: 12, position: "relative", width: "320px" }}>
           <div className="alerts-wrapper" role="region" aria-label="alerts">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-              <strong style={{ color: '#cfe3ff' }}>Alerts</strong>
-              <div style={{ marginLeft: 'auto' }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 8,
+              }}
+            >
+              <strong style={{ color: "#cfe3ff" }}>Alerts</strong>
+              <div style={{ marginLeft: "auto" }}>
                 <button
                   onClick={() => setAlerts([])}
                   title="Clear alerts"
-                  style={{ background: 'transparent', border: 'none', color: '#cfe3ff', cursor: 'pointer' }}
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: "#cfe3ff",
+                    cursor: "pointer",
+                  }}
                 >
                   Clear
                 </button>
@@ -1144,10 +1424,24 @@ export default function App() {
             </div>
             <div style={{ marginTop: 6 }}>
               {alerts.length === 0 ? (
-                <div className="alert-banner" style={{ background: 'transparent', border: '1px dashed #2d3b47', color: '#9fb2c8' }}>No recent alerts</div>
+                <div
+                  className="alert-banner"
+                  style={{
+                    background: "transparent",
+                    border: "1px dashed #2d3b47",
+                    color: "#9fb2c8",
+                  }}
+                >
+                  No recent alerts
+                </div>
               ) : (
                 alerts.map((a) => (
-                  <div key={a.id} className="alert-banner alert-${a.type}" role={a.type === 'error' ? 'alert' : 'status'} aria-live={a.type === 'error' ? 'assertive' : 'polite'}>
+                  <div
+                    key={a.id}
+                    className="alert-banner alert-${a.type}"
+                    role={a.type === "error" ? "alert" : "status"}
+                    aria-live={a.type === "error" ? "assertive" : "polite"}
+                  >
                     {a.msg}
                   </div>
                 ))

@@ -27,6 +27,7 @@ export default function DiagnosticsChart({
   const metrics = useMemo(() => {
     const acc = [];
     const brier = [];
+    const conf = [];
     for (
       let i = 0;
       i < Math.min(history.length, predictionRecords.length);
@@ -36,7 +37,9 @@ export default function DiagnosticsChart({
       if (!rec) continue;
       const truth = history[i];
       acc.push(rec.predicted === truth ? 1 : 0);
-      const probs = rec.probs || [0.25, 0.25, 0.25, 0.25];
+      const probs = rec.probs || rec.mlProbs || [0.25, 0.25, 0.25, 0.25];
+      // confidence = max predicted probability for this record
+      conf.push(Math.max(...probs));
       let bs = 0;
       for (let k = 0; k < 4; k++) {
         const y = truth === k ? 1 : 0;
@@ -46,17 +49,19 @@ export default function DiagnosticsChart({
       brier.push(bs);
     }
     const labels = acc.map((_, i) => i + 1);
-    return { labels, acc, brier };
+    return { labels, acc, brier, conf };
   }, [history, predictionRecords]);
 
   const sliced = useMemo(() => {
     const { labels, acc, brier } = metrics;
+    const { conf } = metrics;
     const len = labels.length;
     const start = Math.max(0, len - windowSize);
     return {
       labels: labels.slice(start),
       acc: acc.slice(start),
       brier: brier.slice(start),
+      conf: (conf || []).slice(start),
     };
   }, [metrics, windowSize]);
 
@@ -74,6 +79,10 @@ export default function DiagnosticsChart({
   };
   const accRoll = roll(sliced.acc, Math.min(20, sliced.acc.length));
   const brierRoll = roll(sliced.brier, Math.min(20, sliced.brier.length));
+  const confRoll = roll(
+    sliced.conf || [],
+    Math.min(20, (sliced.conf || []).length)
+  );
 
   const chartData = {
     labels: sliced.labels,
@@ -82,6 +91,13 @@ export default function DiagnosticsChart({
         label: "Accuracy (rolling)",
         data: accRoll,
         borderColor: "#4ade80",
+        yAxisID: "y1",
+        tension: 0.2,
+      },
+      {
+        label: "Confidence (rolling)",
+        data: confRoll,
+        borderColor: "#60a5fa",
         yAxisID: "y1",
         tension: 0.2,
       },

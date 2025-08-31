@@ -4,20 +4,67 @@ import * as tf from "@tensorflow/tfjs";
 // Exports: buildDataset, buildModel, trainIncremental (with class-balanced sample weights),
 // prepareLastSequence, predictWithMC (MC-dropout style).
 
-export function buildDataset(history, seqLen = 32, maxWindow = 1000) {
+export function buildDataset(
+  history,
+  seqLen = 32,
+  maxWindow = 1000,
+  extraFeatures = 6,
+  ewmaLambda = 0.12
+) {
   const recent = history.slice(-maxWindow);
   if (!recent || recent.length <= seqLen) return null;
   const xs = [];
   const ys = [];
+  // helper: compute features for a global index in history
+  const computeFeaturesForIndex = (hist, idx) => {
+    // features: [runLenScaled, count10, count50, count200, ewmaForClass, prevSame]
+    const feat = [];
+    const cl = hist[idx];
+    // run length ending at idx (including idx)
+    let run = 1;
+    for (let j = idx - 1; j >= Math.max(0, idx - 50); j--) {
+      if (hist[j] === cl) run++;
+      else break;
+    }
+    feat.push(Math.min(10, run) / 10); // scaled to 0..1
+    // recent counts for this class in last 10/50/200 (excluding idx)
+    const windows = [10, 50, 200];
+    for (const w of windows) {
+      let cnt = 0;
+      for (let j = Math.max(0, idx - w); j < idx; j++)
+        if (hist[j] === cl) cnt++;
+      feat.push(cnt / Math.max(1, w));
+    }
+    // ewma for the class up to idx (simple forward loop)
+    let ewma = 0.25;
+    const lambda = typeof ewmaLambda === "number" ? ewmaLambda : 0.12;
+    for (let j = Math.max(0, idx - 1000); j < idx; j++) {
+      const one = [0, 0, 0, 0];
+      if (hist[j] >= 0 && hist[j] < 4) one[hist[j]] = 1;
+      ewma = lambda * one[cl] + (1 - lambda) * ewma;
+    }
+    feat.push(ewma);
+    // prevSame flag
+    feat.push(idx > 0 && hist[idx - 1] === cl ? 1 : 0);
+    return feat.slice(0, extraFeatures);
+  };
+
   for (let i = 0; i + seqLen < recent.length; i++) {
     const window = recent.slice(i, i + seqLen);
     const target = recent[i + seqLen];
-    const oneHotSeq = window.map((c) => [
-      c === 0 ? 1 : 0,
-      c === 1 ? 1 : 0,
-      c === 2 ? 1 : 0,
-      c === 3 ? 1 : 0,
-    ]);
+    const oneHotSeq = window.map((c, j) => {
+      const base = [
+        c === 0 ? 1 : 0,
+        c === 1 ? 1 : 0,
+        c === 2 ? 1 : 0,
+        c === 3 ? 1 : 0,
+      ];
+      // global index in history for this timestep
+      const globalIdx = Math.max(0, history.length - recent.length) + i + j;
+      const feats =
+        extraFeatures > 0 ? computeFeaturesForIndex(history, globalIdx) : [];
+      return base.concat(feats);
+    });
     xs.push(oneHotSeq);
     ys.push([
       target === 0 ? 1 : 0,
@@ -40,8 +87,13 @@ function attentionBlock(x, units = 64) {
   return tf.layers.reshape({ targetShape: [x.shape[2]] }).apply(context);
 }
 
-export function buildModel({ seqLen = 32, dropout = 0.25 } = {}) {
-  const input = tf.input({ shape: [seqLen, 4] });
+export function buildModel({
+  seqLen = 32,
+  dropout = 0.25,
+  extraFeatures = 0,
+} = {}) {
+  const featureDim = 4 + (extraFeatures || 0);
+  const input = tf.input({ shape: [seqLen, featureDim] });
   let x = tf.layers
     .conv1d({ filters: 24, kernelSize: 3, activation: "relu", padding: "same" })
     .apply(input);
@@ -72,7 +124,8 @@ export async function trainIncremental(
   {
     seqLen = 32,
     maxWindow = 1000,
-    epochs = 3,
+    extraFeatures = 6,
+    epochs = 5,
     batchSize = 32,
     decayLambda = 0.0,
     // MC-based confidence filtering: skip samples with mean std > mcUncertaintyThreshold
@@ -87,19 +140,22 @@ export async function trainIncremental(
     lrReducePatience = 2,
     minLR = 1e-6,
     // runtime environment checks
-    requireGPU = false,
+    requireGPU = true,
     workerRecommended = true,
     // Prefer validated results: pass predictionRecords to prioritize learning from
     // correct predictions and also learn from mistakes. These weights tune how
     // much to boost successes vs mistakes and how to respond to streaks.
     predictionRecords = null,
-    successWeight = 2.0,
+    successWeight = 1.5,
     mistakeWeight = 1.5,
     streakWindow = 10,
     streakThreshold = 5,
     streakBoost = 1.5,
     // replay buffer boost: preferentially upweight validated high-confidence matches
-    replayBoost = 3.0,
+    // reduced default to avoid strong feedback loops
+    replayBoost = 1.5,
+    // downweight the rare 'zero' class during resampling (0..1 scale)
+    zeroWeight = 0.25,
     // bias augmentation: oversample sequences whose target class is favored by EWMA
     biasAugment = false,
     augmentFactor = 1.5,
@@ -163,7 +219,13 @@ export async function trainIncremental(
     );
   }
 
-  const ds = buildDataset(history, seqLen, maxWindow);
+  const ds = buildDataset(
+    history,
+    seqLen,
+    maxWindow,
+    extraFeatures,
+    ewmaLambda
+  );
   if (!ds) return null;
   const { xTensor, yTensor } = ds;
 
@@ -202,6 +264,18 @@ export async function trainIncremental(
     });
     const total = counts.reduce((a, b) => a + b, 0) || 1;
     const classWeights = counts.map((c) => total / (4 * Math.max(1, c)));
+    // De-emphasize the rare zero class per user preference: scale class 0 weight down
+    try {
+      if (
+        typeof zeroWeight === "number" &&
+        zeroWeight >= 0 &&
+        zeroWeight <= 1
+      ) {
+        classWeights[0] = classWeights[0] * zeroWeight;
+      }
+    } catch (err) {
+      // ignore and keep original weights
+    }
 
     // If bias augmentation requested, compute simple EWMA over recent history to get favored class probs
     let augmentMultiplier = [1, 1, 1, 1];
@@ -396,7 +470,27 @@ export async function trainIncremental(
     const targetSize = xsArr.length; // keep dataset size stable
     const newXs = [];
     const newYs = [];
-    for (let i = 0; i < targetSize; i++) {
+    // Ensure minimum representation per class when resampling to avoid
+    // collapsing predictions to the dominant classes (important for rare 'zero' class).
+    const minPerClass = Math.max(5, Math.floor(targetSize / 16));
+    // collect indices by class
+    const indicesByClass = [[], [], [], []];
+    for (let ii = 0; ii < xsArr.length; ii++) {
+      const cl = ysArr[ii].indexOf(Math.max(...ysArr[ii]));
+      if (cl >= 0 && cl < 4) indicesByClass[cl].push(ii);
+    }
+
+    // First, guarantee minPerClass samples for each class where available
+    for (let cls = 0; cls < 4; cls++) {
+      const pool = indicesByClass[cls];
+      for (let r = 0; r < Math.min(minPerClass, pool.length); r++) {
+        const srcIdx = pool[Math.floor(Math.random() * pool.length)];
+        newXs.push(xsArr[srcIdx]);
+        newYs.push(ysArr[srcIdx]);
+      }
+    }
+
+    for (let i = newXs.length; i < targetSize; i++) {
       const r = Math.random();
       // binary search on cdf
       let lo = 0,
@@ -586,24 +680,74 @@ export async function trainIncremental(
   }
 }
 
-export function prepareLastSequence(history, seqLen = 32) {
+export function prepareLastSequence(
+  history,
+  seqLen = 32,
+  extraFeatures = 0,
+  ewmaLambda = 0.12
+) {
   if (!history || history.length < seqLen) return null;
-  const window = history.slice(-seqLen);
-  const oneHotSeq = window.map((c) => [
-    c === 0 ? 1 : 0,
-    c === 1 ? 1 : 0,
-    c === 2 ? 1 : 0,
-    c === 3 ? 1 : 0,
-  ]);
-  return tf.tensor([oneHotSeq]);
+  const seq = history.slice(-seqLen);
+  const computeFeaturesForIndex = (hist, idx) => {
+    const feat = [];
+    const cl = hist[idx];
+    let run = 1;
+    for (let j = idx - 1; j >= Math.max(0, idx - 50); j--) {
+      if (hist[j] === cl) run++;
+      else break;
+    }
+    feat.push(Math.min(10, run) / 10);
+    const windows = [10, 50, 200];
+    for (const w of windows) {
+      let cnt = 0;
+      for (let j = Math.max(0, idx - w); j < idx; j++)
+        if (hist[j] === cl) cnt++;
+      feat.push(cnt / Math.max(1, w));
+    }
+    let ewma = 0.25;
+    const lambda = typeof ewmaLambda === "number" ? ewmaLambda : 0.12;
+    for (let j = Math.max(0, idx - 1000); j < idx; j++) {
+      const one = [0, 0, 0, 0];
+      if (hist[j] >= 0 && hist[j] < 4) one[hist[j]] = 1;
+      ewma = lambda * one[cl] + (1 - lambda) * ewma;
+    }
+    feat.push(ewma);
+    feat.push(idx > 0 && hist[idx - 1] === cl ? 1 : 0);
+    return feat.slice(0, extraFeatures);
+  };
+
+  const seqWithFeats = seq.map((c, i) => {
+    const base = [
+      c === 0 ? 1 : 0,
+      c === 1 ? 1 : 0,
+      c === 2 ? 1 : 0,
+      c === 3 ? 1 : 0,
+    ];
+    const globalIdx = history.length - seqLen + i;
+    const feats =
+      extraFeatures > 0 ? computeFeaturesForIndex(history, globalIdx) : [];
+    return base.concat(feats);
+  });
+  return tf.tensor([seqWithFeats]);
 }
 
 export async function predictWithMC(
   model,
   history,
-  { seqLen = 32, mcSamples = 5, noiseStd = 0.02 } = {}
+  {
+    seqLen = 32,
+    mcSamples = 5,
+    noiseStd = 0.02,
+    extraFeatures = 0,
+    ewmaLambda = 0.12,
+  } = {}
 ) {
-  const seqTensor = prepareLastSequence(history, seqLen);
+  const seqTensor = prepareLastSequence(
+    history,
+    seqLen,
+    extraFeatures,
+    ewmaLambda
+  );
   if (!seqTensor)
     return { probs: [0.25, 0.25, 0.25, 0.25], uncertainty: [0, 0, 0, 0] };
   const preds = [];
