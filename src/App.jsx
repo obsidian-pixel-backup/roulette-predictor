@@ -854,6 +854,11 @@ export default function App() {
             // ensure array has space up to idx
             while (copy.length <= idx) copy.push(null);
             const old = copy[idx] || {};
+            // If pushSpin already wrote a concrete predicted value for this index,
+            // don't overwrite it here. This prevents recompute (which runs after
+            // the actual spin is appended to history) from using the truth to
+            // recompute and incorrectly marking the prediction as correct.
+            if (old && old.predicted != null) return prev;
             const predictedVal =
               cal.predicted == null
                 ? sanitizeProbs(calSafe).indexOf(
