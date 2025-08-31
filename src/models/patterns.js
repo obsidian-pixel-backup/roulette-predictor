@@ -5,7 +5,7 @@
 
 export function patternProbs(
   history,
-  { window = 300, maxPattern = 8, minCount = 2 } = {}
+  { window = 300, maxPattern = 8, minCount = 2, ewmaLambda = 0.08 } = {}
 ) {
   if (!history || history.length === 0)
     return { probs: [0.25, 0.25, 0.25, 0.25] };
@@ -57,8 +57,19 @@ export function patternProbs(
     }
   }
 
-  // Fallback: no pattern found, return uniform
-  return { probs: [0.4, 0.32, 0.32, 0.32] };
+  // Fallback: no pattern found. Use an EWMA of recent classes so the
+  // fallback reflects short-term bias instead of a fixed, overconfident vector.
+  // ewmaLambda controls how quickly recent spins dominate.
+  const ewma = [0, 0, 0, 0];
+  for (let i = 0; i < recent.length; i++) {
+    const cls = recent[i];
+    for (let k = 0; k < 4; k++) {
+      ewma[k] = ewma[k] * (1 - ewmaLambda) + (cls === k ? ewmaLambda : 0);
+    }
+  }
+  const s = ewma.reduce((a, b) => a + b, 0) || 1;
+  const probs = ewma.map((v) => Math.max(1e-8, v / s));
+  return { probs };
 }
 
 export default { patternProbs };

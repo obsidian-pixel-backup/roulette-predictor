@@ -32,6 +32,8 @@ import {
   blendLogSpace,
   autoTuner,
   hmmProbs,
+  detectFreqBias,
+  shiftProbsTowardObserved,
 } from "./models/ensemble";
 import { patternProbs } from "./models/patterns";
 import { calibrateProbs } from "./models/calibration";
@@ -153,8 +155,16 @@ export default function App() {
         const probsSafe = sanitizeProbs(
           ensembleRef.current || [0.25, 0.25, 0.25, 0.25]
         );
-        const predicted = probsSafe.indexOf(Math.max(...probsSafe));
-        const rec = { probs: probsSafe, predicted };
+        const maxP = Math.max(...probsSafe);
+        const predicted = probsSafe.indexOf(maxP);
+        const confThresh =
+          Number(hyperparams.predictionConfidenceThreshold) || 0.3;
+        const rec = {
+          probs: probsSafe,
+          predicted: maxP >= confThresh ? predicted : null,
+          skipped: maxP < confThresh,
+          maxProb: maxP,
+        };
         console.debug("pushSpin: recording prediction", {
           probsSafe,
           predicted,
@@ -437,6 +447,81 @@ export default function App() {
         // Sanitize each source before blending to avoid propagating NaNs
         const safeSources = sources.map((s) => sanitizeProbs(s));
 
+        // --- Bias detection (chi-sq) on recent window and apply adjustments ---
+        try {
+          const biasWindow = Math.min(
+            predictionRecords.length,
+            Number(hyperparams.biasWindow) || 1000
+          );
+          const startBias = Math.max(0, predictionRecords.length - biasWindow);
+          const observedCounts = [0, 0, 0, 0];
+          for (let i = startBias; i < predictionRecords.length; i++) {
+            const rec = predictionRecords[i];
+            if (!rec) continue;
+            const t = history[i];
+            if (typeof t === "number") observedCounts[t]++;
+          }
+          // Expected frequencies: roulette dozen approx: [1/37, 12/37,12/37,12/37]
+          const expected = [1 / 37, 12 / 37, 12 / 37, 12 / 37];
+          const biasRes = detectFreqBias(observedCounts, expected, {
+            minSamples: Number(hyperparams.biasMinSamples) || 60,
+          });
+          if (biasRes && biasRes.biased) {
+            // boost bayes & ewma contributions in DQN
+            if (typeof dqn.applyBiasAdjustment === "function") {
+              dqn.applyBiasAdjustment(
+                [
+                  observedCounts[0] /
+                    Math.max(
+                      1,
+                      observedCounts.reduce((a, b) => a + b, 0)
+                    ),
+                  observedCounts[1] /
+                    Math.max(
+                      1,
+                      observedCounts.reduce((a, b) => a + b, 0)
+                    ),
+                  observedCounts[2] /
+                    Math.max(
+                      1,
+                      observedCounts.reduce((a, b) => a + b, 0)
+                    ),
+                  observedCounts[3] /
+                    Math.max(
+                      1,
+                      observedCounts.reduce((a, b) => a + b, 0)
+                    ),
+                ],
+                {
+                  boostFactor: Number(hyperparams.biasBoostFactor) || 1.6,
+                  alpha: 0.7,
+                }
+              );
+            }
+            // also shift the eventual blended logits lightly toward the observed distribution
+            // by setting a small post-blend factor to apply after blending
+            // store for use below via local variable
+            var _biasShift = Number(hyperparams.biasShiftFactor) || 0.12;
+            var _biasObserved = observedCounts.map(
+              (c) =>
+                c /
+                Math.max(
+                  1,
+                  observedCounts.reduce((a, b) => a + b, 0)
+                )
+            );
+            // small user-visible alert
+            pushAlert(
+              `Bias detected (chi2=${biasRes.chi2.toFixed(
+                2
+              )}). Applying bias adjustments.`,
+              "metric",
+              4000
+            );
+          }
+        } catch (e) {
+          console.debug("bias detect failed", e);
+        }
         // Compute per-source rolling performance (accuracy / (brier + eps)) and update DQN weights
         try {
           const nSources = safeSources.length;
@@ -498,6 +583,19 @@ export default function App() {
           clampMax: hyperparams.clampMax || 0.92,
         });
         let blendedSafe = sanitizeProbs(blendedRaw);
+        // If bias detection set local vars, shift blendedSafe gently toward observed
+        if (typeof _biasShift === "number" && Array.isArray(_biasObserved)) {
+          try {
+            blendedSafe = shiftProbsTowardObserved(
+              blendedSafe,
+              _biasObserved,
+              Math.max(0, Math.min(0.6, _biasShift))
+            );
+            blendedSafe = sanitizeProbs(blendedSafe);
+          } catch (e) {
+            console.debug("bias shift failed", e);
+          }
+        }
         // Optional repeat penalty to avoid always parroting the last class when alternatives are close.
         const lastClass = history[history.length - 1];
         let penalized = blendedSafe;
@@ -1266,6 +1364,28 @@ export default function App() {
             />
             <div style={{ fontSize: "0.65rem" }}>
               {(hyperparams.repeatMinGap ?? 0.07).toFixed(3)}
+            </div>
+          </div>
+          <div style={{ minWidth: 180 }}>
+            <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
+              Prediction Confidence Threshold
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={hyperparams.predictionConfidenceThreshold ?? 0.3}
+              onChange={(e) =>
+                setHyperparams((h) => ({
+                  ...h,
+                  predictionConfidenceThreshold: parseFloat(e.target.value),
+                }))
+              }
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "0.65rem" }}>
+              {(hyperparams.predictionConfidenceThreshold ?? 0.3).toFixed(2)}
             </div>
           </div>
           <div style={{ fontSize: "0.6rem", maxWidth: 340, lineHeight: 1.3 }}>

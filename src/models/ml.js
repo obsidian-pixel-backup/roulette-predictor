@@ -82,6 +82,13 @@ export async function trainIncremental(
     // validation + early stopping
     validationSplit = 0.1,
     earlyStoppingPatience = 3,
+    // learning rate scheduling (reduce-on-plateau)
+    lrReduceFactor = 0.5,
+    lrReducePatience = 2,
+    minLR = 1e-6,
+    // runtime environment checks
+    requireGPU = false,
+    workerRecommended = true,
     // Prefer validated results: pass predictionRecords to prioritize learning from
     // correct predictions and also learn from mistakes. These weights tune how
     // much to boost successes vs mistakes and how to respond to streaks.
@@ -91,11 +98,94 @@ export async function trainIncremental(
     streakWindow = 10,
     streakThreshold = 5,
     streakBoost = 1.5,
+    // replay buffer boost: preferentially upweight validated high-confidence matches
+    replayBoost = 3.0,
+    // bias augmentation: oversample sequences whose target class is favored by EWMA
+    biasAugment = false,
+    augmentFactor = 1.5,
+    ewmaLambda = 0.12,
   } = {}
 ) {
+  // Runtime environment checks: ensure GPU backend when requested and warn/fallback
+  try {
+    const backend =
+      typeof tf.getBackend === "function"
+        ? tf.getBackend()
+        : tf && tf.env && typeof tf.env === "function"
+        ? tf.env().get("BACKEND")
+        : "unknown";
+    const gpuBackends = ["webgl", "webgpu", "tensorflow"];
+    const hasGPU = gpuBackends.includes(backend);
+    let workerAvailable = false;
+    try {
+      if (typeof window !== "undefined" && typeof Worker === "function")
+        workerAvailable = true;
+    } catch (e) {
+      workerAvailable = false;
+    }
+    if (!hasGPU) {
+      const msg = `tfjs backend is '${backend}' — GPU backend not detected. Training will run on CPU; consider switching to a GPU-capable backend for faster training.`;
+      if (requireGPU) {
+        console.warn(
+          msg +
+            " requireGPU=true was requested; proceeding on CPU but performance will be degraded."
+        );
+      } else {
+        console.warn(msg);
+      }
+      // attempt to set cpu backend if possible
+      try {
+        if (typeof tf.setBackend === "function") {
+          // only change if not already cpu
+          if (backend !== "cpu") {
+            const ok = tf.setBackend("cpu");
+            if (ok && typeof ok.then === "function") await ok;
+            if (typeof tf.ready === "function") await tf.ready();
+          }
+        }
+      } catch (e) {
+        // non-fatal
+        console.warn(
+          "Failed to switch TF backend to cpu (non-fatal):",
+          e && e.message ? e.message : e
+        );
+      }
+    }
+    if (workerRecommended && !workerAvailable) {
+      console.warn(
+        "Web Worker API not available - for heavy training consider using a Worker to avoid blocking the UI."
+      );
+    }
+  } catch (e) {
+    console.warn(
+      "Runtime backend check failed:",
+      e && e.message ? e.message : e
+    );
+  }
+
   const ds = buildDataset(history, seqLen, maxWindow);
   if (!ds) return null;
   const { xTensor, yTensor } = ds;
+
+  // LR helpers (shared): tries multiple optimizer shapes used by tfjs
+  const getLR = () => {
+    try {
+      const cfg = model?.optimizer?.getConfig?.();
+      const lr = cfg?.learningRate ?? model?.optimizer?.learningRate;
+      return typeof lr === "number" ? lr : (lr && lr.val) || 0.001;
+    } catch (err) {
+      return 0.001;
+    }
+  };
+  const setLR = (v) => {
+    try {
+      if (model?.optimizer?.setLearningRate) model.optimizer.setLearningRate(v);
+      else if (model?.optimizer?.learningRate != null)
+        model.optimizer.learningRate = v;
+    } catch (err) {
+      // ignore
+    }
+  };
 
   // TFJS in the browser currently doesn't support `sampleWeight` in model.fit
   // (error: "sample weight is not supported yet"). Implement weighted training
@@ -113,6 +203,36 @@ export async function trainIncremental(
     const total = counts.reduce((a, b) => a + b, 0) || 1;
     const classWeights = counts.map((c) => total / (4 * Math.max(1, c)));
 
+    // If bias augmentation requested, compute simple EWMA over recent history to get favored class probs
+    let augmentMultiplier = [1, 1, 1, 1];
+    try {
+      if (biasAugment) {
+        const recent = history.slice(-Math.max(ysArr.length + seqLen, 1));
+        // compute EWMA of one-hot class indicators
+        let ewma = [0.25, 0.25, 0.25, 0.25];
+        const lambda = typeof ewmaLambda === "number" ? ewmaLambda : 0.12;
+        for (
+          let i = Math.max(0, recent.length - 1000);
+          i < recent.length;
+          i++
+        ) {
+          const c = recent[i];
+          const one = [0, 0, 0, 0];
+          if (c >= 0 && c < 4) one[c] = 1;
+          for (let k = 0; k < 4; k++)
+            ewma[k] = lambda * one[k] + (1 - lambda) * ewma[k];
+        }
+        // compute multipliers: boost classes with ewma > 0.25 proportionally
+        for (let k = 0; k < 4; k++) {
+          const excess = Math.max(0, ewma[k] - 0.25);
+          augmentMultiplier[k] = 1 + augmentFactor * excess; // e.g., augmentFactor=1.5
+        }
+      }
+    } catch (err) {
+      console.debug("trainIncremental: ewma augment failed", err);
+      augmentMultiplier = [1, 1, 1, 1];
+    }
+
     // apply optional recency decay to prioritize recent samples (decayLambda==0 disables)
     const N = ysArr.length;
     const sampleWeights = ysArr.map((y, i) => {
@@ -121,7 +241,7 @@ export async function trainIncremental(
       if (!decayLambda || decayLambda <= 0) return base;
       // recency weight: more recent samples (higher i) get larger weight
       const recency = Math.exp(-decayLambda * (N - 1 - i));
-      return base * recency;
+      return base * recency * (augmentMultiplier[idx] || 1);
     });
 
     // If predictionRecords were provided, boost weights for validated positives
@@ -170,6 +290,10 @@ export async function trainIncremental(
           if (rec.predicted === truth) {
             sampleWeights[localIdx] =
               (sampleWeights[localIdx] || 1) * (successWeight || 1);
+            // If the prediction was high-confidence (not skipped), boost strongly
+            if (!rec.skipped && replayBoost && replayBoost > 1) {
+              sampleWeights[localIdx] *= replayBoost;
+            }
           } else {
             // mistakes get a smaller boost by default but still emphasized
             sampleWeights[localIdx] =
@@ -320,10 +444,13 @@ export async function trainIncremental(
       validationSplit > 0
     ) {
       // Manual early-stopping loop: fit one epoch at a time and monitor val_loss
-      let bestVal = Infinity;
-      let stale = 0;
       const maxEpochs = epochs;
       finalHistory = { loss: [], acc: [], val_loss: [], val_acc: [] };
+      // learning rate scheduling state
+      let bestVal = Infinity;
+      let stale = 0;
+      let lrStale = 0; // tracks epochs since last lr reduction
+
       for (let e = 0; e < maxEpochs; e++) {
         const h = await model.fit(newX, newY, {
           epochs: 1,
@@ -342,9 +469,20 @@ export async function trainIncremental(
           if (valLoss + 1e-8 < bestVal) {
             bestVal = valLoss;
             stale = 0;
+            lrStale = 0;
           } else {
             stale++;
+            lrStale++;
           }
+        }
+        // reduce LR on plateau
+        if (lrStale >= lrReducePatience) {
+          const cur = getLR();
+          const next = Math.max(minLR, cur * (lrReduceFactor || 0.5));
+          if (next < cur - 1e-12) {
+            setLR(next);
+          }
+          lrStale = 0;
         }
         if (stale >= earlyStoppingPatience) break;
       }
@@ -396,6 +534,12 @@ export async function trainIncremental(
         let bestVal = Infinity;
         let stale = 0;
         finalHistory = { loss: [], acc: [], val_loss: [], val_acc: [] };
+        // fallback manual loop with lr scheduling
+        let bestVal2 = Infinity;
+        let stale2 = 0;
+        let lrStale2 = 0;
+        const getLR2 = getLR;
+        const setLR2 = setLR;
         for (let e = 0; e < epochs; e++) {
           const h = await model.fit(xTensor, yTensor, {
             epochs: 1,
@@ -410,14 +554,22 @@ export async function trainIncremental(
           const valLossArr = h.history?.val_loss || [];
           const valLoss = valLossArr[valLossArr.length - 1];
           if (valLoss != null && isFinite(valLoss)) {
-            if (valLoss + 1e-8 < bestVal) {
-              bestVal = valLoss;
-              stale = 0;
+            if (valLoss + 1e-8 < bestVal2) {
+              bestVal2 = valLoss;
+              stale2 = 0;
+              lrStale2 = 0;
             } else {
-              stale++;
+              stale2++;
+              lrStale2++;
             }
           }
-          if (stale >= earlyStoppingPatience) break;
+          if (lrStale2 >= lrReducePatience) {
+            const cur = getLR2();
+            const next = Math.max(minLR, cur * (lrReduceFactor || 0.5));
+            if (next < cur - 1e-12) setLR2(next);
+            lrStale2 = 0;
+          }
+          if (stale2 >= earlyStoppingPatience) break;
         }
       } else {
         const h = await model.fit(xTensor, yTensor, fitOpts);
