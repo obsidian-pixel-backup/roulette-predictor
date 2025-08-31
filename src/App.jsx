@@ -33,6 +33,7 @@ import {
   autoTuner,
   hmmProbs,
 } from "./models/ensemble";
+import { patternProbs } from "./models/patterns";
 import { calibrateProbs } from "./models/calibration";
 import DiagnosticsChart from "./components/DiagnosticsChart";
 import PredictionCard from "./components/PredictionCard";
@@ -122,6 +123,7 @@ export default function App() {
   const trainingRef = useRef(false); // lock for fit()
   const [pendingQueue, setPendingQueue] = useState(0); // remaining spins in simulation queue
   const [isTraining, setIsTraining] = useState(false); // UI flag for active training
+  const [simCountInput, setSimCountInput] = useState(100);
   const pushAlert = useCallback((msg, type = "info", ttl = 6000) => {
     const id = ++alertIdRef.current;
     setAlerts((a) => [...a, { id, msg, type }]);
@@ -308,6 +310,30 @@ export default function App() {
       setPredictionRecords([]); // rebuild progressively
       pushAlert(`Imported ${arr.length} spins`, "info");
     }
+    // Sanitize imported predictionRecords if present
+    if (
+      imported.predictionRecords &&
+      Array.isArray(imported.predictionRecords)
+    ) {
+      try {
+        const sanitized = imported.predictionRecords.map((rec) => {
+          const probs = sanitizeProbs(rec.probs);
+          const predicted =
+            typeof rec.predicted === "number"
+              ? rec.predicted
+              : probs.indexOf(Math.max(...probs));
+          // If sourceProbs were exported, sanitize each source array too
+          const sourceProbs = Array.isArray(rec.sourceProbs)
+            ? rec.sourceProbs.map((s) => sanitizeProbs(s))
+            : undefined;
+          return { ...rec, probs, predicted, sourceProbs };
+        });
+        setPredictionRecords(sanitized);
+        pushAlert(`Imported ${sanitized.length} prediction records`, "info");
+      } catch (e) {
+        console.warn("Imported predictionRecords malformed, skipping", e);
+      }
+    }
     if (imported.bayesState) setBayesState(imported.bayesState);
     if (imported.markovState) setMarkovState(imported.markovState);
     if (imported.streakState) setStreakState(imported.streakState);
@@ -390,6 +416,11 @@ export default function App() {
         });
         setMcMarkovState(mc);
         const statBlend = aggregateStatsMethods([bayes, mk, st, ew]);
+        const pat = patternProbs(history, {
+          window: 300,
+          maxPattern: 8,
+          minCount: 2,
+        });
         const sources = [
           bayes.probs,
           mk.probs,
@@ -398,12 +429,70 @@ export default function App() {
           mlProbs || statBlend,
           hmm.probs,
           mc.probs,
+          pat.probs,
         ];
         if (dqn.nSources !== sources.length)
           setDqn(new DQNWeights({ nSources: sources.length }));
         const weights = dqn.weights.slice(0, sources.length);
         // Sanitize each source before blending to avoid propagating NaNs
         const safeSources = sources.map((s) => sanitizeProbs(s));
+
+        // Compute per-source rolling performance (accuracy / (brier + eps)) and update DQN weights
+        try {
+          const nSources = safeSources.length;
+          const perfWindow = Math.min(
+            predictionRecords.length,
+            hyperparams.perfWindow || 100
+          );
+          const startIdx = Math.max(0, predictionRecords.length - perfWindow);
+          const stats = Array.from({ length: nSources }, () => ({
+            correct: 0,
+            brier: 0,
+            cnt: 0,
+          }));
+          for (let i = startIdx; i < predictionRecords.length; i++) {
+            const rec = predictionRecords[i];
+            if (!rec || !Array.isArray(rec.sourceProbs)) continue;
+            const truth = history[i];
+            for (let si = 0; si < nSources; si++) {
+              const sp = sanitizeProbs(rec.sourceProbs[si]);
+              const predIdx = sp.indexOf(Math.max(...sp));
+              if (predIdx === truth) stats[si].correct++;
+              let bsum = 0;
+              for (let k = 0; k < 4; k++) {
+                const y = truth === k ? 1 : 0;
+                bsum += (sp[k] - y) * (sp[k] - y);
+              }
+              stats[si].brier += bsum;
+              stats[si].cnt++;
+            }
+          }
+          const eps = 1e-6;
+          let perfScores = stats.map((s) => {
+            const cnt = s.cnt || 0;
+            if (!cnt) return 0;
+            const acc = s.correct / cnt;
+            const avgBrier = s.brier / (cnt * 4);
+            return (acc + eps) / (avgBrier + eps);
+          });
+          const totalScore = perfScores.reduce((a, b) => a + b, 0);
+          if (!totalScore || !isFinite(totalScore)) {
+            perfScores = dqn.weights.slice(0, nSources);
+          }
+          // Apply to DQN with moderate smoothing (alpha)
+          if (typeof dqn.applyPerformanceWeights === "function") {
+            dqn.applyPerformanceWeights(perfScores, 0.6);
+          } else if (totalScore) {
+            // fallback: normalize and assign locally
+            const normalized = perfScores.map((s) => Math.max(0.01, s));
+            const ssum = normalized.reduce((a, b) => a + b, 0) || 1;
+            const nw = normalized.map((v) => v / ssum);
+            for (let i = 0; i < nw.length; i++) weights[i] = nw[i];
+          }
+        } catch (e) {
+          // non-fatal
+          console.debug("perf weight calc failed", e);
+        }
         const blendedRaw = blendLogSpace(safeSources, weights, {
           temperature: hyperparams.temperature || 1.0,
           clampMax: hyperparams.clampMax || 0.92,
@@ -446,6 +535,34 @@ export default function App() {
               else break;
             }
             const stuckRunThreshold = hyperparams.stuckRunThreshold ?? 12; // lower threshold
+            // Hard prediction limit: if a class is predicted repeatedly and failing,
+            // force a different class after `predictionLimit` repeats.
+            const predictionLimit = hyperparams.predictionLimit ?? 4;
+            if (runLen > predictionLimit) {
+              // compute recent accuracy for this run
+              let correctInRunHard = 0;
+              for (
+                let i = predictionRecords.length - runLen;
+                i < predictionRecords.length;
+                i++
+              ) {
+                if (predictionRecords[i]?.predicted === history[i])
+                  correctInRunHard++;
+              }
+              const runAccHard = correctInRunHard / runLen;
+              // If run is failing (<50% accuracy), apply a strong forced penalty
+              if (runAccHard < 0.5) {
+                const forceDecay = Math.min(
+                  hyperparams.stuckPenaltyForced ?? 0.35,
+                  blendedSafe[lastPred] * 0.8
+                );
+                const redistributeF = forceDecay / 3;
+                let forced = blendedSafe.map((p, i) =>
+                  i === lastPred ? p - forceDecay : p + redistributeF
+                );
+                penalized = sanitizeProbs(forced);
+              }
+            }
             if (runLen >= stuckRunThreshold) {
               let correctInRun = 0;
               for (
@@ -655,6 +772,19 @@ export default function App() {
             seqLen,
             epochs: 2,
             batchSize: 32,
+            decayLambda: Number(hyperparams.decayLambda) || 0.0,
+            mcSamples: Number(hyperparams.mcSamples) || 5,
+            mcUncertaintyThreshold:
+              Number(hyperparams.mcUncertaintyThreshold) || 0.05,
+            validationSplit: Number(hyperparams.validationSplit) || 0.1,
+            earlyStoppingPatience:
+              Number(hyperparams.earlyStoppingPatience) || 3,
+            predictionRecords,
+            successWeight: Number(hyperparams.successWeight) || 2.0,
+            mistakeWeight: Number(hyperparams.mistakeWeight) || 1.5,
+            streakWindow: Number(hyperparams.streakWindow) || 10,
+            streakThreshold: Number(hyperparams.streakThreshold) || 5,
+            streakBoost: Number(hyperparams.streakBoost) || 1.5,
           });
           trainingQueueRef.current = [];
           if (canceled) return;
@@ -680,6 +810,19 @@ export default function App() {
                     seqLen,
                     epochs: 1,
                     batchSize: 32,
+                    decayLambda: Number(hyperparams.decayLambda) || 0.0,
+                    mcSamples: Number(hyperparams.mcSamples) || 5,
+                    mcUncertaintyThreshold:
+                      Number(hyperparams.mcUncertaintyThreshold) || 0.05,
+                    validationSplit: Number(hyperparams.validationSplit) || 0.1,
+                    earlyStoppingPatience:
+                      Number(hyperparams.earlyStoppingPatience) || 3,
+                    predictionRecords,
+                    successWeight: Number(hyperparams.successWeight) || 2.0,
+                    mistakeWeight: Number(hyperparams.mistakeWeight) || 1.5,
+                    streakWindow: Number(hyperparams.streakWindow) || 10,
+                    streakThreshold: Number(hyperparams.streakThreshold) || 5,
+                    streakBoost: Number(hyperparams.streakBoost) || 1.5,
                   });
                 }
                 trainingQueueRef.current = [];
@@ -851,39 +994,50 @@ export default function App() {
             </div>
           );
         })()}
-      </header>
-      {alerts.length > 0 && (
-        <div style={{ padding: "0.5rem 2rem", width: "100%" }}>
-          {alerts.map((a) => (
-            <div
-              key={a.id}
-              className="alert-banner"
-              style={{
-                background:
-                  a.type === "error"
-                    ? "#3d1f1f"
-                    : a.type === "metric"
-                    ? "#1e2f1e"
-                    : "#1e2835",
-                borderColor:
-                  a.type === "error"
-                    ? "#6b2d2d"
-                    : a.type === "metric"
-                    ? "#2f6b3a"
-                    : "#2d3f55",
-              }}
-            >
-              {a.msg}
-            </div>
-          ))}
+        <div style={{ marginLeft: 12, position: "relative" }}>
+          <div className="toast-anchor">
+            {alerts.map((a) => (
+              <div
+                key={a.id}
+                className={`alert-toast alert-${a.type}`}
+                role={a.type === "error" ? "alert" : "status"}
+                aria-live={a.type === "error" ? "assertive" : "polite"}
+              >
+                {a.msg}
+              </div>
+            ))}
+          </div>
         </div>
-      )}
+      </header>
       <section className="controls">
         <SpinInput onAdd={handleManualClassAdd} />
         <div className="btn-row">
           <button onClick={() => runSimulation(20)}>Sim 20</button>
           <button onClick={() => runSimulation(100)}>Sim 100</button>
           <button onClick={() => runSimulationBatched(500)}>Sim 500</button>
+          {/* Manual simulation count control */}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+            <input
+              type="number"
+              min={1}
+              value={simCountInput ?? 100}
+              onChange={(e) => setSimCountInput(Number(e.target.value))}
+              style={{
+                width: 90,
+                padding: "6px 8px",
+                borderRadius: 6,
+                border: "1px solid #2d3f55",
+                background: "var(--card)",
+                color: "var(--text)",
+              }}
+              aria-label="Number of simulations"
+            />
+            <button
+              onClick={() => runSimulationBatched(Number(simCountInput || 100))}
+            >
+              Run
+            </button>
+          </div>
           <button
             onClick={() => {
               if (
@@ -987,6 +1141,112 @@ export default function App() {
               {(hyperparams.repeatPenalty ?? 0.08).toFixed(3)}
             </div>
           </div>
+          <div style={{ minWidth: 220 }}>
+            <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
+              Decay Lambda (recency weighting for training)
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={0.1}
+              step={0.001}
+              value={hyperparams.decayLambda ?? 0}
+              onChange={(e) => {
+                const val = parseFloat(e.target.value);
+                setHyperparams((h) => ({ ...h, decayLambda: val }));
+              }}
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "0.65rem" }}>
+              {(hyperparams.decayLambda ?? 0).toFixed(3)}
+            </div>
+          </div>
+          <div style={{ minWidth: 220 }}>
+            <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
+              MC Samples
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={hyperparams.mcSamples ?? 5}
+              onChange={(e) =>
+                setHyperparams((h) => ({
+                  ...h,
+                  mcSamples: parseInt(e.target.value || "5", 10),
+                }))
+              }
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "0.65rem" }}>
+              {hyperparams.mcSamples ?? 5}
+            </div>
+          </div>
+          <div style={{ minWidth: 180 }}>
+            <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
+              MC Uncertainty Thresh
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={0.2}
+              step={0.001}
+              value={hyperparams.mcUncertaintyThreshold ?? 0.05}
+              onChange={(e) =>
+                setHyperparams((h) => ({
+                  ...h,
+                  mcUncertaintyThreshold: parseFloat(e.target.value),
+                }))
+              }
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "0.65rem" }}>
+              {(hyperparams.mcUncertaintyThreshold ?? 0.05).toFixed(3)}
+            </div>
+          </div>
+          <div style={{ minWidth: 180 }}>
+            <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
+              Val Split
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={0.5}
+              step={0.01}
+              value={hyperparams.validationSplit ?? 0.1}
+              onChange={(e) =>
+                setHyperparams((h) => ({
+                  ...h,
+                  validationSplit: parseFloat(e.target.value),
+                }))
+              }
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "0.65rem" }}>
+              {(hyperparams.validationSplit ?? 0.1).toFixed(2)}
+            </div>
+          </div>
+          <div style={{ minWidth: 140 }}>
+            <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
+              Early Stop Patience
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={10}
+              value={hyperparams.earlyStoppingPatience ?? 3}
+              onChange={(e) =>
+                setHyperparams((h) => ({
+                  ...h,
+                  earlyStoppingPatience: parseInt(e.target.value || "3", 10),
+                }))
+              }
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "0.65rem" }}>
+              {hyperparams.earlyStoppingPatience ?? 3}
+            </div>
+          </div>
           <div style={{ minWidth: 180 }}>
             <label style={{ fontSize: "0.65rem", opacity: 0.75 }}>
               Min Gap to Trigger (confidence gap)
@@ -1012,6 +1272,68 @@ export default function App() {
             Baseline set at spin index {penaltyBaselineIndex ?? "—"}. Pre / post
             accuracy computed relative to that point.
           </div>
+          <details className="glossary">
+            <summary style={{ cursor: "pointer" }}>
+              Glossary — how to tune controls
+            </summary>
+            <div
+              style={{ paddingTop: 8, fontSize: "0.85rem", lineHeight: 1.35 }}
+            >
+              <dl>
+                <dt style={{ fontWeight: 600 }}>Penalty</dt>
+                <dd style={{ margin: "0 0 0.6rem 0" }}>
+                  Reduces the top predicted probability when the same class is
+                  repeatedly predicted. Increase slightly if the system gets
+                  stuck repeating a class incorrectly; decrease if it becomes
+                  overly conservative.
+                </dd>
+
+                <dt style={{ fontWeight: 600 }}>Min Gap to Trigger</dt>
+                <dd style={{ margin: "0 0 0.6rem 0" }}>
+                  Minimum confidence gap between top and second prediction
+                  required to apply the repeat penalty. Raise to avoid
+                  penalizing when the model is clearly confident; lower to be
+                  more aggressive.
+                </dd>
+
+                <dt style={{ fontWeight: 600 }}>Decay Lambda</dt>
+                <dd style={{ margin: "0 0 0.6rem 0" }}>
+                  Recency weighting applied during training resampling. Small
+                  positive values prioritize recent spins to adapt to drift; set
+                  near 0 to treat history uniformly.
+                </dd>
+
+                <dt style={{ fontWeight: 600 }}>MC Samples</dt>
+                <dd style={{ margin: "0 0 0.6rem 0" }}>
+                  Number of stochastic forward passes used to estimate model
+                  uncertainty. More samples give better uncertainty estimates
+                  but increase compute time.
+                </dd>
+
+                <dt style={{ fontWeight: 600 }}>MC Uncertainty Thresh</dt>
+                <dd style={{ margin: "0 0 0.6rem 0" }}>
+                  Threshold on mean per-class std from MC sampling. Samples with
+                  uncertainty above this are skipped during training to avoid
+                  learning from noisy labels. Lower to be stricter.
+                </dd>
+
+                <dt style={{ fontWeight: 600 }}>Val Split</dt>
+                <dd style={{ margin: "0 0 0.6rem 0" }}>
+                  Fraction of training data held out for validation used for
+                  early stopping. Typical values 0.05–0.2. Increase to get
+                  better early stopping signals, but leave enough data to train
+                  on.
+                </dd>
+
+                <dt style={{ fontWeight: 600 }}>Early Stop Patience</dt>
+                <dd style={{ margin: "0 0 0.6rem 0" }}>
+                  Number of validation epochs with no improvement before
+                  training halts. Set small (1–3) for quick stops, higher to
+                  allow slow improvements.
+                </dd>
+              </dl>
+            </div>
+          </details>
         </fieldset>
       </section>
       <div className="layout-grid">

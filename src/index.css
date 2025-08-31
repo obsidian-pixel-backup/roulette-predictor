@@ -303,6 +303,110 @@ button:disabled {
   padding: 0.6rem 0.8rem;
   border-radius: var(--radius);
   font-size: 0.8rem;
+  display: inline-block;
+  margin: 0.25rem;
+  min-width: 180px;
+  max-width: calc(100% - 4rem);
+  word-break: break-word;
+}
+
+.alerts-wrapper {
+  padding: 0.5rem 2rem;
+  width: 100%;
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+@media (max-width: 700px) {
+  .alerts-wrapper {
+    padding: 0.5rem 1rem;
+    gap: 0.4rem;
+  }
+  .alert-banner {
+    padding: 0.5rem 0.6rem;
+    font-size: 0.75rem;
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
+  }
+}
+
+.glossary {
+  width: 100%;
+  margin-top: 0.5rem;
+  color: var(--text);
+}
+.glossary summary {
+  list-style: none;
+  background: transparent;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid #243240;
+}
+.glossary[open] summary {
+  border-color: #3a5a7a;
+}
+.glossary dl {
+  margin: 0.5rem 0 0 0;
+}
+.glossary dt {
+  color: #cfe3ff;
+}
+.glossary dd {
+  margin-left: 0;
+  color: #cbd8e6;
+}
+
+/* Toasts anchored in header */
+.toast-anchor {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+  pointer-events: none; /* allow clicks through to header badges */
+}
+.alert-toast {
+  pointer-events: auto;
+  min-width: 220px;
+  max-width: 420px;
+  padding: 0.6rem 0.9rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  color: var(--text);
+  border: 1px solid transparent;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  transform: translateY(-6px);
+  opacity: 0;
+  transition: transform 220ms ease, opacity 220ms ease;
+}
+.toast-anchor .alert-toast {
+  transform: translateY(0);
+  opacity: 1;
+}
+.alert-toast.alert-error {
+  background: #3d1f1f;
+  border-color: #6b2d2d;
+}
+.alert-toast.alert-metric {
+  background: #152217;
+  border-color: #2f6b3a;
+}
+.alert-toast.alert-info {
+  background: #1e2835;
+  border-color: #2d3f55;
+}
+
+@media (max-width: 700px) {
+  .alert-toast {
+    width: calc(100vw - 2rem);
+    max-width: none;
+    min-width: 0;
+    font-size: 0.8rem;
+    padding: 0.5rem 0.6rem;
+  }
 }
 
 ::-webkit-scrollbar {

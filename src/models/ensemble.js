@@ -138,7 +138,9 @@ export class DQNWeights {
     return actions[Math.floor(Math.random() * actions.length)];
   }
   applyAction(action) {
-    const delta = 0.05;
+    // Smaller step to avoid large sudden weight shifts which can cause
+    // longer stuck runs when a single source dominates.
+    const delta = 0.02;
     if (action.type === "inc") this.weights[action.idx] += delta;
     else this.weights[action.idx] -= delta;
     // Clamp & renormalize
@@ -154,6 +156,25 @@ export class DQNWeights {
     } else {
       this.epsilon = Math.max(0.05, this.epsilon - 0.005);
     }
+  }
+  // Apply externally computed performance scores (not necessarily bounded).
+  // perfScores: array of non-negative scores per source. alpha: smoothing factor [0..1]
+  applyPerformanceWeights(perfScores = [], alpha = 0.7) {
+    if (!Array.isArray(perfScores) || perfScores.length !== this.nSources)
+      return;
+    // normalize perfScores
+    const clipped = perfScores.map((s) => (isFinite(s) && s > 0 ? s : 0));
+    const sum = clipped.reduce((a, b) => a + b, 0) || 1;
+    const norm = clipped.map((s) => s / sum);
+    // blend with existing weights
+    const blended = this.weights.map(
+      (w, i) => alpha * norm[i] + (1 - alpha) * w
+    );
+    // clamp and renormalize
+    for (let i = 0; i < blended.length; i++)
+      blended[i] = Math.max(0.01, blended[i]);
+    const s2 = blended.reduce((a, b) => a + b, 0) || 1;
+    this.weights = blended.map((w) => w / s2);
   }
   toJSON() {
     return {
@@ -192,11 +213,24 @@ export function blendLogSpace(
     });
   });
   // Temperature scaling
-  const expVals = logBlend.map((l) =>
-    Math.exp(l / Math.max(1e-6, temperature))
-  );
+  const computeExp = (temp) =>
+    logBlend.map((l) => Math.exp(l / Math.max(1e-6, temp)));
+  let expVals = computeExp(temperature);
   const es = expVals.reduce((a, b) => a + b, 0) || 1;
   let probs = expVals.map((e) => e / es);
+  // Entropy-based fallback: if resulting distribution is too low-entropy
+  // (overconfident), increase temperature slightly to flatten probabilities.
+  const entropy = probs.reduce((s, p) => (p > 0 ? s - p * Math.log2(p) : s), 0);
+  const entropyThresh = 1.05; // target minimal entropy for 4 classes (~2.0 is max)
+  if (entropy < entropyThresh) {
+    const tempAdj = Math.min(
+      2.0,
+      temperature + (entropyThresh - entropy) * 0.6
+    );
+    expVals = computeExp(tempAdj);
+    const es2 = expVals.reduce((a, b) => a + b, 0) || 1;
+    probs = expVals.map((e) => e / es2);
+  }
   // Overconfidence clamp
   const maxP = Math.max(...probs);
   if (maxP > clampMax) {
@@ -252,6 +286,15 @@ export function autoTuner({
       (newHypers.mcDropoutSamples || 5) + 1
     );
     dqn.epsilon = Math.min(0.5, dqn.epsilon + 0.02);
+    // If accuracy is very low, increase stuck-run penalty aggressiveness
+    newHypers.stuckPenalty = Math.min(
+      0.3,
+      (newHypers.stuckPenalty || 0.12) + 0.05
+    );
+    newHypers.stuckRunThreshold = Math.max(
+      6,
+      (newHypers.stuckRunThreshold || 12) - 3
+    );
   } else if (accuracy > 0.45) {
     newHypers.mcMarkovSims = Math.max(
       100,
