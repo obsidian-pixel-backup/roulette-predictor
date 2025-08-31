@@ -152,28 +152,50 @@ export default function App() {
   const changeScheduleRef = useRef(null); // transient schedule after change-point detection
   const pushSpin = useCallback(
     (cls) => {
-      // Capture prediction BEFORE adding the new spin using latest ensembleRef
-      setPredictionRecords((pr) => {
-        // Record a placeholder prediction record; leave `predicted` null so
-        // the recompute pipeline (which runs shortly after) can apply
-        // calibration and the final decision. This avoids transient -1
-        // no-bet markers that were based on stale hyperparams or pre-calibration.
+      // Compute a calibrated prediction immediately so the history table
+      // shows a stable predicted value even when spins arrive quickly.
+      try {
+        const baseProbs = sanitizeProbs(
+          ensembleRef.current || [0.25, 0.25, 0.25, 0.25]
+        );
+        // Use last known diagnostics for perf hints (may be undefined)
+        const perf = (diagnosticsSummary && diagnosticsSummary.lastEval) || {};
+        const cal = calibrateProbs(baseProbs, calibrationState, {
+          avgAcc: perf.avgAcc,
+          avgBrier: perf.avgBrier,
+        });
+        const calSafe = sanitizeProbs(cal.probs);
+        const rec = {
+          probs: calSafe,
+          sourceProbs: undefined,
+          mlProbs: mlProbs || undefined,
+          mlUncertainty: mlUncertainty || undefined,
+          predicted:
+            cal.predicted == null
+              ? calSafe.indexOf(Math.max(...calSafe))
+              : cal.predicted,
+          skipped: !!cal.skipped,
+          maxProb: Math.max(...calSafe),
+          calibrationState: cal.calibrationState,
+          ts: Date.now(),
+        };
+        setPredictionRecords((pr) => [...pr, rec]);
+      } catch (err) {
+        // fallback to previous placeholder behavior on error
         const probsSafe = sanitizeProbs(
           ensembleRef.current || [0.25, 0.25, 0.25, 0.25]
         );
-        const maxP = Math.max(...probsSafe);
-        const rec = {
-          probs: probsSafe,
-          predicted: null,
-          skipped: false,
-          maxProb: maxP,
-        };
-        console.debug("pushSpin: queued prediction (pending calibration)", {
-          probsSafe,
-          cls,
-        });
-        return [...pr, rec];
-      });
+        setPredictionRecords((pr) => [
+          ...pr,
+          {
+            probs: probsSafe,
+            predicted: null,
+            skipped: false,
+            maxProb: Math.max(...probsSafe),
+            ts: Date.now(),
+          },
+        ]);
+      }
       setHistory((prev) => {
         const newHist = [...prev, cls];
         // Queue for training
@@ -183,7 +205,7 @@ export default function App() {
         return newHist;
       });
     },
-    [pushAlert]
+    [pushAlert, calibrationState, diagnosticsSummary, mlProbs, mlUncertainty]
   );
 
   const handleManualClassAdd = (cls) => {
@@ -827,34 +849,38 @@ export default function App() {
         // use the final post-calibration prediction.
         try {
           setPredictionRecords((prev) => {
-            if (!Array.isArray(prev) || prev.length === 0) return prev;
-            const idx = prev.length - 1;
-            const old = prev[idx] || {};
+            const copy = Array.isArray(prev) ? prev.slice() : [];
+            const idx = Math.max(0, (history ? history.length : 0) - 1);
+            // ensure array has space up to idx
+            while (copy.length <= idx) copy.push(null);
+            const old = copy[idx] || {};
+            const predictedVal =
+              cal.predicted == null
+                ? sanitizeProbs(calSafe).indexOf(
+                    Math.max(...sanitizeProbs(calSafe))
+                  )
+                : cal.predicted;
+            const truth =
+              typeof history[idx] === "number" ? history[idx] : null;
+            const brierVal =
+              truth != null
+                ? sanitizeProbs(calSafe).reduce(
+                    (acc, p, k) => acc + Math.pow(p - (truth === k ? 1 : 0), 2),
+                    0
+                  ) / 4
+                : null;
             const newRec = {
               ...old,
               probs: sanitizeProbs(calSafe),
               sourceProbs: safeSources,
               mlProbs: mlProbs || old.mlProbs,
               mlUncertainty: mlUncertainty || old.mlUncertainty,
-              predicted:
-                cal.predicted == null
-                  ? sanitizeProbs(calSafe).indexOf(
-                      Math.max(...sanitizeProbs(calSafe))
-                    )
-                  : cal.predicted,
+              predicted: predictedVal,
               skipped: !!cal.skipped,
               maxProb: Math.max(...(calSafe || [0.25, 0.25, 0.25, 0.25])),
               calibrationState: cal.calibrationState,
-              brier:
-                typeof history[idx] === "number"
-                  ? sanitizeProbs(calSafe).reduce(
-                      (acc, p, k) =>
-                        acc + Math.pow(p - (history[idx] === k ? 1 : 0), 2),
-                      0
-                    ) / 4
-                  : null,
+              brier: brierVal,
             };
-            const copy = prev.slice();
             copy[idx] = newRec;
             return copy;
           });
