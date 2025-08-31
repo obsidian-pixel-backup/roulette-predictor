@@ -150,6 +150,7 @@ export default function App() {
   const trainingQueueRef = useRef([]);
   const TRAIN_BATCH_SIZE = 5;
   const changeScheduleRef = useRef(null); // transient schedule after change-point detection
+  const cpConsecRef = useRef(0); // consecutive CP confirmations
   const pushSpin = useCallback(
     (cls) => {
       // Compute a calibrated prediction immediately so the history table
@@ -565,53 +566,72 @@ export default function App() {
             seg: Number(hyperparams.cpSeg) || 20,
             threshold: Number(hyperparams.cpThreshold) || 0.28,
           });
+          // If a change is detected, require K consecutive confirmations before acting.
           if (cp && cp.changed) {
-            // Use a cooldown to avoid firing on nearly every spin
-            const now = Date.now();
-            const cooldown = Number(hyperparams.cpCooldownMs) || 120000; // 120s default
-            const lastTrig =
-              (changeScheduleRef.current &&
-                changeScheduleRef.current.lastTriggered) ||
-              0;
-            if (now - lastTrig > cooldown) {
-              // Moderate the suggested multipliers to be less aggressive by default
-              const raw = cp.suggested || {};
-              const suggested = {
-                ewmaLambdaMult: Math.min(
-                  raw.ewmaLambdaMult || 1,
-                  Number(hyperparams.cpMaxEwmaMult) || 1.8
-                ),
-                lrMult: Math.min(
-                  raw.lrMult || 1,
-                  Number(hyperparams.cpMaxLrMult) || 2.5
-                ),
-                replayBoostMult: Math.min(
-                  raw.replayBoostMult || 1,
-                  Number(hyperparams.cpMaxReplayMult) || 2.0
-                ),
-              };
-              // schedule a short-lived boost: increase ewma lambda, lr, replayBoost and reduce decayLambda
-              changeScheduleRef.current = {
-                until: now + (Number(hyperparams.cpDurationMs) || 15000),
-                suggested,
-                lastTriggered: now,
-                score: cp.score,
-              };
-              pushAlert(
-                `Change detected (score=${cp.score.toFixed(
-                  3
-                )}). Applying transient recency boost.`,
-                "metric",
-                4000
-              );
+            const K = Number(hyperparams.cpConfirmations) || 2;
+            cpConsecRef.current = (cpConsecRef.current || 0) + 1;
+            console.debug(
+              "cp detected",
+              cpConsecRef.current,
+              "of",
+              K,
+              "score",
+              cp.score
+            );
+            if (cpConsecRef.current >= K) {
+              // confirmed: reset counter and attempt to schedule
+              cpConsecRef.current = 0;
+              const now = Date.now();
+              const cooldown = Number(hyperparams.cpCooldownMs) || 120000; // 120s default
+              const lastTrig =
+                (changeScheduleRef.current &&
+                  changeScheduleRef.current.lastTriggered) ||
+                0;
+              if (now - lastTrig > cooldown) {
+                // Moderate the suggested multipliers to be less aggressive by default
+                const raw = cp.suggested || {};
+                const suggested = {
+                  ewmaLambdaMult: Math.min(
+                    raw.ewmaLambdaMult || 1,
+                    Number(hyperparams.cpMaxEwmaMult) || 1.8
+                  ),
+                  lrMult: Math.min(
+                    raw.lrMult || 1,
+                    Number(hyperparams.cpMaxLrMult) || 2.5
+                  ),
+                  replayBoostMult: Math.min(
+                    raw.replayBoostMult || 1,
+                    Number(hyperparams.cpMaxReplayMult) || 2.0
+                  ),
+                };
+                // schedule a short-lived boost: increase ewma lambda, lr, replayBoost and reduce decayLambda
+                changeScheduleRef.current = {
+                  until: now + (Number(hyperparams.cpDurationMs) || 15000),
+                  suggested,
+                  lastTriggered: now,
+                  score: cp.score,
+                };
+                pushAlert(
+                  `Change detected (score=${cp.score.toFixed(
+                    3
+                  )}). Applying transient recency boost.`,
+                  "metric",
+                  4000
+                );
+              } else {
+                // suppress frequent re-triggers
+                console.debug("change detect suppressed by cooldown", {
+                  score: cp.score,
+                  lastTriggered: lastTrig,
+                  cooldown,
+                });
+              }
             } else {
-              // suppress frequent re-triggers
-              console.debug("change detect suppressed by cooldown", {
-                score: cp.score,
-                lastTriggered: lastTrig,
-                cooldown,
-              });
+              // waiting for more confirmations; do nothing yet
             }
+          } else {
+            // no change observed: reset consecutive confirmation counter
+            cpConsecRef.current = 0;
           }
         } catch (e) {
           console.debug("change detect failed", e);
@@ -820,10 +840,52 @@ export default function App() {
         }
         const avgAcc = cnt ? correct / cnt : 0;
         const avgBrier = cnt ? brierSum / (cnt * 4) : 0.25;
-        const cal = calibrateProbs(penalized, calibrationState, {
-          avgAcc,
-          avgBrier,
-        });
+        // Compute adaptive abstain threshold when recent losing run observed
+        let optThreshold = undefined;
+        try {
+          // compute recent losing run (consecutive wrong predictions at tail)
+          let lossRun = 0;
+          for (let i = predictionRecords.length - 1; i >= 0; i--) {
+            const rec = predictionRecords[i];
+            if (
+              !rec ||
+              typeof rec.predicted !== "number" ||
+              typeof history[i] !== "number"
+            )
+              break;
+            if (rec.predicted !== history[i]) lossRun++;
+            else break;
+          }
+          const abstainRunThreshold =
+            Number(hyperparams.abstainRunThreshold) || 6;
+          const abstainBoost = Number(hyperparams.abstainBoost) || 0.15; // raise threshold by this amount
+          if (lossRun >= abstainRunThreshold) {
+            // raise local threshold to be more conservative
+            const baseThresh =
+              (calibrationState &&
+                calibrationState.predictionConfidenceThreshold) ||
+              0.3;
+            optThreshold = Math.min(0.99, baseThresh + abstainBoost);
+            console.debug(
+              "abstain boost active for lossRun",
+              lossRun,
+              "threshold",
+              optThreshold
+            );
+          }
+        } catch (e) {
+          // ignore
+        }
+
+        const cal = calibrateProbs(
+          penalized,
+          calibrationState,
+          {
+            avgAcc,
+            avgBrier,
+          },
+          { confidenceThreshold: optThreshold }
+        );
         const calSafe = sanitizeProbs(cal.probs);
         // Debug: if ensemble ends up uniform, log source details to help trace
         const isUniform = calSafe.every((p) => Math.abs(p - 0.25) < 1e-6);
@@ -859,12 +921,120 @@ export default function App() {
             // the actual spin is appended to history) from using the truth to
             // recompute and incorrectly marking the prediction as correct.
             if (old && old.predicted != null) return prev;
-            const predictedVal =
-              cal.predicted == null
-                ? sanitizeProbs(calSafe).indexOf(
-                    Math.max(...sanitizeProbs(calSafe))
-                  )
-                : cal.predicted;
+            // Derive final predicted value with additional safety heuristics:
+            const probsForDecision = sanitizeProbs(calSafe);
+            const topProb = Math.max(...probsForDecision);
+            const argmax = probsForDecision.indexOf(topProb);
+            let predictedVal = cal.predicted == null ? argmax : cal.predicted;
+
+            // Forced diversification: if same class has been predicted many times and failing,
+            // choose the 2nd-best instead of repeating the same prediction.
+            try {
+              const lastPred =
+                predictionRecords[predictionRecords.length - 1]?.predicted;
+              if (typeof lastPred === "number") {
+                let rep = 0;
+                for (let i = predictionRecords.length - 1; i >= 0; i--) {
+                  if (predictionRecords[i]?.predicted === lastPred) rep++;
+                  else break;
+                }
+                const forcedAfter =
+                  Number(hyperparams.forcedDiversionAfter) || 8;
+                const forcedMaxAcc =
+                  Number(hyperparams.forcedDiversionMaxAcc) || 0.5;
+                // compute recent accuracy for this run
+                let correctInRun = 0;
+                for (
+                  let i = predictionRecords.length - rep;
+                  i < predictionRecords.length;
+                  i++
+                ) {
+                  if (predictionRecords[i]?.predicted === history[i])
+                    correctInRun++;
+                }
+                const runAcc = rep ? correctInRun / rep : 1;
+                if (rep >= forcedAfter && runAcc < forcedMaxAcc) {
+                  // pick second-best
+                  const sorted = probsForDecision
+                    .map((p, idx) => ({ p, idx }))
+                    .sort((a, b) => b.p - a.p);
+                  if (sorted.length > 1) {
+                    predictedVal = sorted[1].idx;
+                    console.debug(
+                      "forced diversification: choosing second-best",
+                      predictedVal,
+                      "rep",
+                      rep,
+                      "runAcc",
+                      runAcc
+                    );
+                  }
+                }
+              }
+            } catch (e) {
+              // ignore
+            }
+
+            // Entropy-based soft sampling: when model is uncertain and we've seen repeats,
+            // sample from a flattened distribution to inject exploration.
+            try {
+              const entropy = probsForDecision.reduce(
+                (s, p) => (p > 0 ? s - p * Math.log2(p) : s),
+                0
+              );
+              const entropyThresh =
+                Number(hyperparams.entropySamplingEntropyThresh) || 1.2;
+              const repeatForSampling =
+                Number(hyperparams.entropySamplingRepeatN) || 6;
+              const lastPred =
+                predictionRecords[predictionRecords.length - 1]?.predicted;
+              let repCount = 0;
+              if (typeof lastPred === "number") {
+                for (let i = predictionRecords.length - 1; i >= 0; i--) {
+                  if (predictionRecords[i]?.predicted === lastPred) repCount++;
+                  else break;
+                }
+              }
+              const entropyTopP =
+                Number(hyperparams.entropySamplingTopP) || 0.65;
+              const entropyTemp =
+                Number(hyperparams.entropySamplingTemp) || 1.6;
+              if (
+                topProb < entropyTopP &&
+                repCount >= repeatForSampling &&
+                entropy > entropyThresh
+              ) {
+                // soften and sample
+                const t = entropyTemp;
+                const softened = probsForDecision.map((p) =>
+                  Math.pow(Math.max(p, 1e-8), 1 / t)
+                );
+                const ssum = softened.reduce((a, b) => a + b, 0) || 1;
+                const softProbs = softened.map((v) => v / ssum);
+                // sample according to softProbs
+                const r = Math.random();
+                let acc = 0;
+                for (let k = 0; k < softProbs.length; k++) {
+                  acc += softProbs[k];
+                  if (r <= acc) {
+                    predictedVal = k;
+                    break;
+                  }
+                }
+                console.debug(
+                  "entropy soft-sampling picked",
+                  predictedVal,
+                  "topProb",
+                  topProb,
+                  "rep",
+                  repCount,
+                  "entropy",
+                  entropy.toFixed(3)
+                );
+              }
+            } catch (e) {
+              // ignore
+            }
             const truth =
               typeof history[idx] === "number" ? history[idx] : null;
             const brierVal =
